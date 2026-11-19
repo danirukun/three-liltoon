@@ -1,5 +1,5 @@
 import { Color, Vector2, Vector3, Vector4, Texture } from 'three';
-import { NodeMaterial, PhongLightingModel, UniformNode, TextureNode as TextureNode$1 } from 'three/webgpu';
+import { NodeMaterial, LightingModel, UniformNode, TextureNode as TextureNode$1 } from 'three/webgpu';
 
 /** Supported Unity shader names and their pass configurations. */
 declare const shaderVariants: {
@@ -90,7 +90,7 @@ declare class LilToonNodeMaterial extends NodeMaterial {
     constructor(parameters?: LilToonNodeMaterialParameters);
     get variant(): LilToonShaderVariant;
     /** One overridable place for the lighting model. A subclass supplies its own. */
-    setupLightingModel(): PhongLightingModel;
+    setupLightingModel(): LightingModel;
     setProperty(name: string, value: LilToonScalarOrVector): void;
     getProperty(name: string): number | number[] | undefined;
     setTexture(name: string, value: Texture | null): void;
@@ -102,6 +102,13 @@ declare class LilToonNodeMaterial extends NodeMaterial {
     getWarnings(): LilToonWarning[];
     customProgramCacheKey(): string;
     copy(source: LilToonNodeMaterial): this;
+    /**
+     * Build the nodes that read this material. The constructor and `copy` call it,
+     * because NodeMaterial.copy aliases the source nodes. A subclass overrides it,
+     * calls `super.setupNodes()`, and assigns its own nodes. It runs before the
+     * subclass field initializers, so it must not read subclass fields.
+     */
+    protected setupNodes(): void;
 }
 
 declare class GLTFLilToonNodeExtension {

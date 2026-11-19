@@ -1655,7 +1655,7 @@ var LilToonNodeMaterial = class extends NodeMaterial {
     for (const [name, value] of Object.entries(parameters.textures ?? {}))
       this.#assignTexture(name, value);
     this.#applyAlphaMode();
-    this.#buildNodes();
+    this.setupNodes();
   }
   get variant() {
     return this.#variant;
@@ -1733,7 +1733,7 @@ var LilToonNodeMaterial = class extends NodeMaterial {
     this.#propertyNodes.clear();
     this.#textureNodes.clear();
     this.#applyAlphaMode();
-    this.#buildNodes();
+    this.setupNodes();
     this.needsUpdate = true;
     return this;
   }
@@ -1766,7 +1766,13 @@ var LilToonNodeMaterial = class extends NodeMaterial {
     this.transparent = this.#mode === "transparent";
     if (this.#mode === "transparent") this.depthWrite = false;
   }
-  #buildNodes() {
+  /**
+   * Build the nodes that read this material. The constructor and `copy` call it,
+   * because NodeMaterial.copy aliases the source nodes. A subclass overrides it,
+   * calls `super.setupNodes()`, and assigns its own nodes. It runs before the
+   * subclass field initializers, so it must not read subclass fields.
+   */
+  setupNodes() {
     const st = this.propertyNode("_MainTex_ST", "vec4");
     const color = this.propertyNode("_Color", "vec4");
     const main = this.textureNode("_MainTex").sample(

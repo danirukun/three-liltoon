@@ -1,7 +1,11 @@
 import { Vector2, Vector3, Vector4 } from "three";
 import type { Texture } from "three";
 import { NodeMaterial, PhongLightingModel } from "three/webgpu";
-import type { TextureNode as TextureNodeType, UniformNode } from "three/webgpu";
+import type {
+	LightingModel,
+	TextureNode as TextureNodeType,
+	UniformNode,
+} from "three/webgpu";
 import { float, texture, uniform, uv, vec4 } from "three/tsl";
 import { LILTOON_DEFAULTS } from "../generated/defaults.js";
 import type { LilToonShaderVariant } from "../material/shaderVariants.js";
@@ -89,7 +93,7 @@ export class LilToonNodeMaterial extends NodeMaterial {
 		for (const [name, value] of Object.entries(parameters.textures ?? {}))
 			this.#assignTexture(name, value);
 		this.#applyAlphaMode();
-		this.#buildNodes();
+		this.setupNodes();
 	}
 
 	get variant(): LilToonShaderVariant {
@@ -97,7 +101,7 @@ export class LilToonNodeMaterial extends NodeMaterial {
 	}
 
 	/** One overridable place for the lighting model. A subclass supplies its own. */
-	override setupLightingModel(): PhongLightingModel {
+	override setupLightingModel(): LightingModel {
 		return new PhongLightingModel(false);
 	}
 
@@ -181,7 +185,7 @@ export class LilToonNodeMaterial extends NodeMaterial {
 		this.#propertyNodes.clear();
 		this.#textureNodes.clear();
 		this.#applyAlphaMode();
-		this.#buildNodes();
+		this.setupNodes();
 		this.needsUpdate = true;
 		return this;
 	}
@@ -225,7 +229,13 @@ export class LilToonNodeMaterial extends NodeMaterial {
 		if (this.#mode === "transparent") this.depthWrite = false;
 	}
 
-	#buildNodes(): void {
+	/**
+	 * Build the nodes that read this material. The constructor and `copy` call it,
+	 * because NodeMaterial.copy aliases the source nodes. A subclass overrides it,
+	 * calls `super.setupNodes()`, and assigns its own nodes. It runs before the
+	 * subclass field initializers, so it must not read subclass fields.
+	 */
+	protected setupNodes(): void {
 		const st = this.propertyNode("_MainTex_ST", "vec4");
 		const color = this.propertyNode("_Color", "vec4");
 		const main = this.textureNode("_MainTex").sample(

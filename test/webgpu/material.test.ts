@@ -1,4 +1,6 @@
 import { LinearSRGBColorSpace, SRGBColorSpace, Texture } from "three";
+import { LightingModel } from "three/webgpu";
+import { float } from "three/tsl";
 import { describe, expect, it } from "vitest";
 import { getNeutralTexture } from "../../src/utils/texture";
 import { LilToonNodeMaterial } from "../../src/webgpu/LilToonNodeMaterial";
@@ -177,5 +179,37 @@ describe("LilToonNodeMaterial clone", () => {
 			1, 0, 0, 1,
 		]);
 		expect(clone.getProperty("_Color")).not.toBe(source.getProperty("_Color"));
+	});
+});
+
+describe("LilToonNodeMaterial subclass hooks", () => {
+	it("lets a subclass supply its own lighting model", () => {
+		class Custom extends LightingModel {}
+		const model = new Custom();
+		class Sub extends LilToonNodeMaterial {
+			override setupLightingModel(): LightingModel {
+				return model;
+			}
+		}
+		expect(new Sub().setupLightingModel()).toBe(model);
+		expect(new LilToonNodeMaterial().setupLightingModel()).toBeInstanceOf(
+			LightingModel,
+		);
+	});
+
+	it("rebuilds subclass nodes on clone", () => {
+		class Sub extends LilToonNodeMaterial {
+			protected override setupNodes(): void {
+				super.setupNodes();
+				this.alphaTestNode = float(1);
+			}
+		}
+		const source = new Sub();
+		expect(source.alphaTestNode).not.toBeNull();
+		const clone = source.clone();
+		expect(clone).toBeInstanceOf(Sub);
+		expect(clone.alphaTestNode).not.toBeNull();
+		expect(clone.alphaTestNode).not.toBe(source.alphaTestNode);
+		expect(clone.colorNode).not.toBe(source.colorNode);
 	});
 });
