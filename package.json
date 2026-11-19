@@ -80,8 +80,8 @@
 		"example:viewer:build": "npm --prefix examples/mochiya-liltoon-viewer run build",
 		"typecheck": "npm run generate:all && tsc --noEmit",
 		"build:webgpu": "npm run generate && tsup --config tsup.webgpu.config.ts",
-		"build:package": "npm run generate:all && tsup && npm run package:stage",
-		"build": "npm run generate:all && tsc --noEmit && tsup && npm run package:stage",
+		"build:package": "npm run generate:all && tsup && tsup --config tsup.webgpu.config.ts && npm run package:stage",
+		"build": "npm run generate:all && tsc --noEmit && tsup && tsup --config tsup.webgpu.config.ts && npm run package:stage",
 		"prepublishOnly": "npm run build && npm test"
 	},
 	"peerDependencies": {
