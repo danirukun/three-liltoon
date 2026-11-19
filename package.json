@@ -47,6 +47,10 @@
 			"types": "./dist/vrm.d.ts",
 			"import": "./dist/vrm.js"
 		},
+		"./webgpu": {
+			"types": "./dist/webgpu.d.ts",
+			"import": "./dist/webgpu.js"
+		},
 		"./schema": "./dist/schema/MOCHIYA_materials_liltoon.schema.json"
 	},
 	"engines": {
@@ -75,6 +79,7 @@
 		"example:viewer:dev": "npm --prefix examples/mochiya-liltoon-viewer run dev",
 		"example:viewer:build": "npm --prefix examples/mochiya-liltoon-viewer run build",
 		"typecheck": "npm run generate:all && tsc --noEmit",
+		"build:webgpu": "npm run generate && tsup --config tsup.webgpu.config.ts",
 		"build:package": "npm run generate:all && tsup && npm run package:stage",
 		"build": "npm run generate:all && tsc --noEmit && tsup && npm run package:stage",
 		"prepublishOnly": "npm run build && npm test"
@@ -93,13 +98,13 @@
 		"@playwright/test": "^1.62.1",
 		"@types/node": "^24.3.0",
 		"@types/pngjs": "^6.0.5",
-		"@types/three": "^0.185.4",
+		"@types/three": "0.187.0",
 		"ajv": "^8.20.0",
 		"pixelmatch": "^7.2.0",
 		"pngjs": "^7.0.0",
 		"prettier": "3.9.6",
 		"rimraf": "^6.0.1",
-		"three": "^0.180.0",
+		"three": "0.187.0",
 		"ts-json-schema-generator": "2.4.0",
 		"tsup": "^8.5.0",
 		"tsx": "^4.20.5",
