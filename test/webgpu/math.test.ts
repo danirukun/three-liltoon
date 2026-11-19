@@ -1,7 +1,10 @@
 import { describe, expect, it } from "vitest";
 import {
 	UNITY_LIGHT_SCALE,
+	lilAOShift,
 	lilBand,
+	lilShadowBands,
+	type LilShadowBandsInput,
 	lilGray,
 	lilHalfLambert,
 	lilLimitLight,
@@ -46,6 +49,83 @@ describe("lilBand", () => {
 		expect(lilBand(0.46, 0.5, 0.1, 0.08)).toBeCloseTo(0.5, 6);
 		// border 0.15, blur 0.1, range 0.2: min saturate(-0.15) = 0, max 0.2. 0.05 / 0.2 = 0.25.
 		expect(lilBand(0.05, 0.15, 0.1, 0.2)).toBeCloseTo(0.25, 6);
+	});
+});
+
+describe("lilBand anti-aliasing", () => {
+	// LIL_ANTIALIAS_MODE 1, lil_common_functions.hlsl:61 and 68:
+	// (value - borderMin) / saturate(borderMax - borderMin + fwidth(value) * aascale). `aa` is fwidth(value) * aascale.
+	it("widens the ramp by the anti-aliasing term", () => {
+		// min 0.45, max 0.55: 0.05 / saturate(0.1 + 0.1) = 0.25.
+		expect(lilBand(0.5, 0.5, 0.1, 0, 0.1)).toBeCloseTo(0.25, 6);
+		// blur 0: min = max = 0.5: 0.01 / saturate(0 + 0.02) = 0.5.
+		expect(lilBand(0.51, 0.5, 0, 0, 0.02)).toBeCloseTo(0.5, 6);
+	});
+});
+
+describe("lilAOShift", () => {
+	// lil_common_frag.hlsl:1011-1014.
+	it("shifts the border mask channels", () => {
+		// r: 0.4 * 2 - 0.1 = 0.7. g: 0.5 * 0.5 + 0.6 = 0.85. b: 0.2 * 1 + 0.3 = 0.5.
+		close(
+			lilAOShift([0.4, 0.5, 0.2], [2, -0.1, 0.5, 0.6], [1, 0.3, 0, 0]),
+			[0.7, 0.85, 0.5],
+		);
+		// Saturated: 1.5 -> 1, -1 -> 0, 3 -> 1.
+		close(lilAOShift([1, 1, 1], [1, 0.5, -1, 0], [3, 0, 0, 0]), [1, 0, 1]);
+	});
+});
+
+const bandsBase: LilShadowBandsInput = {
+	ln: [1, 1, 1],
+	border: [0.5, 0.15, 0.25],
+	blur: [0.1, 0.1, 0.1],
+	blurMask: [1, 1, 1],
+	borderRange: 0.08,
+	ao: [1, 1, 1],
+	postAO: false,
+	aa: [0, 0, 0],
+};
+
+// lil_common_frag.hlsl:983-1026: the blur mask, then the AO border mask before or after the tooning.
+describe("lilShadowBands", () => {
+	it("multiplies the AO mask before the tooning", () => {
+		// lns.xyz = [1, 0.6, 0.6] * [0.5, 0.3, 1] = [0.5, 0.18, 0.6]; lns.w = lns.x = 0.5.
+		// x: (0.5 - 0.45) / 0.1 = 0.5. y: (0.18 - 0.1) / 0.1 = 0.8. z: (0.6 - 0.2) / 0.1 -> 1.
+		// w: min 0.37, max 0.55: (0.5 - 0.37) / 0.18 = 0.7222222.
+		close(
+			lilShadowBands({ ...bandsBase, ln: [1, 0.6, 0.6], ao: [0.5, 0.3, 1] }),
+			[0.5, 0.8, 1, 0.7222222],
+		);
+	});
+
+	it("multiplies the AO mask after the tooning with _ShadowPostAO", () => {
+		// x: (0.47 - 0.45) / 0.1 = 0.2, * 0.5 = 0.1. y: (0.11 - 0.1) / 0.1 = 0.1, * 0.3 = 0.03.
+		// z: (0.6 - 0.2) / 0.1 = 4, * 1, saturated to 1. w: (0.47 - 0.37) / 0.18 = 0.5555556, * 0.5 = 0.2777778.
+		close(
+			lilShadowBands({
+				...bandsBase,
+				ln: [0.47, 0.11, 0.6],
+				ao: [0.5, 0.3, 1],
+				postAO: true,
+			}),
+			[0.1, 0.03, 1, 0.2777778],
+		);
+	});
+
+	it("scales the blur by the blur mask and adds the anti-aliasing term", () => {
+		// x: blur 0.05: min 0.475, max 0.525, denominator 0.05 + 0.05: (0.5 - 0.475) / 0.1 = 0.25.
+		// w: min 0.395, max 0.525, denominator 0.13 + 0.05: (0.5 - 0.395) / 0.18 = 0.5833333.
+		// y: (0.5 - 0.1) / 0.1 -> 1. z: (0.5 - 0.2) / 0.1 -> 1.
+		close(
+			lilShadowBands({
+				...bandsBase,
+				ln: [0.5, 0.5, 0.5],
+				blurMask: [0.5, 1, 1],
+				aa: [0.05, 0, 0],
+			}),
+			[0.25, 1, 1, 0.5833333],
+		);
 	});
 });
 

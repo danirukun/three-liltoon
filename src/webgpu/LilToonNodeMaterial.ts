@@ -110,7 +110,7 @@ export class LilToonNodeMaterial extends NodeMaterial {
 
 	/** One overridable place for the lighting model. A subclass supplies its own. */
 	override setupLightingModel(): LightingModel {
-		return new LilToonLightingModel(this);
+		return new LilToonLightingModel(this, this.#lightingHost());
 	}
 
 	override setupLighting(builder: NodeBuilder): Node {
@@ -143,19 +143,6 @@ export class LilToonNodeMaterial extends NodeMaterial {
 		_iblIrradiance: Node<"vec3">,
 	): Node<"vec3"> | null {
 		return null;
-	}
-
-	/** @internal The build state that LilToonLightingModel reads. */
-	lightingHost(): LilToonLightingHost {
-		const features = new Set(this.#features());
-		return {
-			shadowed: this.#shadowed,
-			features,
-			hasTexture: (name) => this.#textures[name] != null,
-			receivedShadow: (shadow) => this.receivedShadow(shadow),
-			roomIrradiance: (irradiance, iblIrradiance) =>
-				this.roomIrradiance(irradiance, iblIrradiance),
-		};
 	}
 
 	setProperty(name: string, value: LilToonScalarOrVector): void {
@@ -262,6 +249,23 @@ export class LilToonNodeMaterial extends NodeMaterial {
 		if (!node) return;
 		if (Array.isArray(value)) (node.value as VectorValue).fromArray(value);
 		else node.value = value;
+	}
+
+	/**
+	 * The build state of the lighting model. `setupLighting` assigns the shadowed set and then calls
+	 * `setupLightingModel` synchronously, so the model keeps the set of its own build. r187 buildAsync runs the model
+	 * after an await, and another build of this material can replace `#shadowed` in that gap.
+	 */
+	#lightingHost(): LilToonLightingHost {
+		const textures = { ...this.#textures };
+		return {
+			shadowed: this.#shadowed,
+			features: new Set(this.#features()),
+			hasTexture: (name) => textures[name] != null,
+			receivedShadow: (shadow) => this.receivedShadow(shadow),
+			roomIrradiance: (irradiance, iblIrradiance) =>
+				this.roomIrradiance(irradiance, iblIrradiance),
+		};
 	}
 
 	#features(): (keyof LilToonFeatureSet)[] {

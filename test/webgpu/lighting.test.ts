@@ -20,8 +20,14 @@ const fakeContext = () => ({
 	outgoingLight: vec3().toVar(),
 });
 
-const runModel = (material: LilToonNodeMaterial, lights: Light[]) => {
-	const model = material.setupLightingModel() as LilToonLightingModel;
+const runModel = (
+	source: LilToonNodeMaterial | LilToonLightingModel,
+	lights: Light[],
+) => {
+	const model =
+		source instanceof LilToonLightingModel
+			? source
+			: (source.setupLightingModel() as LilToonLightingModel);
 	const context = fakeContext();
 	const builder = {
 		context,
@@ -96,6 +102,59 @@ describe("LilToonLightingModel", () => {
 		expect(getShadow(shadowed)).toBe(shadowed.baseColorNode);
 		runModel(material, [shadowed, plain]);
 		expect(seen).toEqual([shadowed.shadowNode]);
+	});
+
+	it("keeps the shadowed lights of its own build when the material builds again", () => {
+		const seen: Node[] = [];
+		const models: LilToonLightingModel[] = [];
+		class Sub extends LilToonNodeMaterial {
+			override setupLightingModel(): LilToonLightingModel {
+				const model = super.setupLightingModel() as LilToonLightingModel;
+				models.push(model);
+				return model;
+			}
+			protected override receivedShadow(shadow: Node<"float">): Node<"float"> {
+				seen.push(shadow);
+				return shadow;
+			}
+		}
+		const material = new Sub({
+			properties: { _UseShadow: 1, _ShadowReceive: 1 },
+		});
+		const shadowed: Light = { shadowNode: float(0.3), baseColorNode: vec3(1) };
+		// r187 buildAsync runs setupLighting, awaits, and runs the model start later. A sync build can come between.
+		getShadowOf(material)(shadowed);
+		getShadowOf(material);
+		expect(models).toHaveLength(2);
+		runModel(models[0]!, [shadowed]);
+		expect(seen).toEqual([shadowed.shadowNode]);
+		runModel(models[1]!, [shadowed]);
+		expect(seen).toEqual([shadowed.shadowNode]);
+	});
+
+	it("samples the shadow masks once for each build", () => {
+		const material = new LilToonNodeMaterial({
+			properties: { _UseShadow: 1 },
+			textures: {
+				_ShadowStrengthMask: new Texture(),
+				_ShadowBlurMask: new Texture(),
+				_ShadowBorderMask: new Texture(),
+			},
+		});
+		const light: Light = { shadowNode: null, baseColorNode: null };
+		const { assigned } = runModel(material, [light, light]);
+		expect(assigned).toEqual([
+			"lilShadowBlurMask",
+			"lilShadowBorderMask",
+			"lilLight",
+			"lilLightWeight",
+			"lilBands",
+			"lilLight",
+			"lilLightWeight",
+			"lilBands",
+			"lilAmbient",
+			"outgoingLight",
+		]);
 	});
 
 	it("passes the context irradiance to the roomIrradiance hook of a subclass", () => {

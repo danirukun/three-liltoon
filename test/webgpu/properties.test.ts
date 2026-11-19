@@ -143,6 +143,41 @@ describe("nodeWarnings", () => {
 		expect(nodeWarnings("Body", { _UseShadow: 1, _UseRim: 1 }, {})).toEqual([]);
 	});
 
+	it("reports the flat and face shadow mask types", () => {
+		for (const type of [1, 2]) {
+			const warnings = nodeWarnings(
+				"Face",
+				{ _UseShadow: 1, _ShadowMaskType: type },
+				{},
+			);
+			expect(warnings).toHaveLength(1);
+			expect(warnings[0]).toMatchObject({
+				code: "unsupported-feature",
+				property: "_ShadowMaskType",
+				materialName: "Face",
+			});
+		}
+	});
+
+	it("reports the LUT shadow color type", () => {
+		const warnings = nodeWarnings(
+			"Body",
+			{ _UseShadow: 1, _ShadowColorType: 1 },
+			{},
+		);
+		expect(warnings).toHaveLength(1);
+		expect(warnings[0]).toMatchObject({
+			code: "unsupported-feature",
+			property: "_ShadowColorType",
+		});
+	});
+
+	it("does not report a shadow type when the shadow is off", () => {
+		expect(
+			nodeWarnings("Body", { _ShadowMaskType: 2, _ShadowColorType: 1 }, {}),
+		).toEqual([]);
+	});
+
 	it("reports an unsupported shader variant", () => {
 		const warnings = nodeWarnings("Body", {}, {}, "Hidden/lilToonGem");
 		expect(warnings.map((w) => w.code)).toEqual(["unsupported-shader-variant"]);

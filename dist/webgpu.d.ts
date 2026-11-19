@@ -1,5 +1,5 @@
 import { Color, Vector2, Vector3, Vector4, Texture } from 'three';
-import { Node, LightingModel, NodeBuilder, LightingModelDirectInput, NodeMaterial, UniformNode, TextureNode as TextureNode$1 } from 'three/webgpu';
+import { NodeMaterial, LightingModel, NodeBuilder, Node, UniformNode, TextureNode as TextureNode$1, LightingModelDirectInput } from 'three/webgpu';
 
 /** Supported Unity shader names and their pass configurations. */
 declare const shaderVariants: {
@@ -53,35 +53,6 @@ interface LilToonFeatureSet {
     dissolve: boolean;
 }
 
-type Float = Node<"float">;
-type Vec3 = Node<"vec3">;
-/** What the lighting model reads from its material while it builds. The material makes a new one for each build. */
-interface LilToonLightingHost {
-    /** The light nodes whose shadow AnalyticLightNode gave to `getShadow` instead of the light color. */
-    shadowed: ReadonlySet<object>;
-    features: ReadonlySet<keyof LilToonFeatureSet>;
-    hasTexture(name: string): boolean;
-    receivedShadow(shadow: Float): Float;
-    roomIrradiance(irradiance: Vec3, iblIrradiance: Vec3): Vec3 | null;
-}
-/**
- * The lilToon lighting of LilToonNodeMaterial.
- *
- * Unity lilToon shades one main light (the directional light plus the SH ambient) with the bands. This model shades
- * each three light with its own bands and sums them: `direct()` adds the light color × UNITY_LIGHT_SCALE to a summed
- * light, and its bands × lilGray(light color) to a band sum. `finish()` divides the band sum by the summed weight
- * and shades the summed light once, as lilGetShading shades the main light. With one light this is the Unity result.
- */
-declare class LilToonLightingModel extends LightingModel {
-    #private;
-    readonly material: LilToonNodeMaterial;
-    constructor(material: LilToonNodeMaterial);
-    start(builder: NodeBuilder): void;
-    direct(input: LightingModelDirectInput): void;
-    indirect(builder: NodeBuilder): void;
-    finish(builder: NodeBuilder): void;
-}
-
 type LilToonScalarOrVector = number | boolean | number[] | Color | Vector2 | Vector3 | Vector4;
 type LilToonNodeValue = number | number[];
 type LilToonNodeMode = "opaque" | "cutout" | "transparent";
@@ -131,8 +102,6 @@ declare class LilToonNodeMaterial extends NodeMaterial {
      * `iblIrradiance` is what `setupEnvironment()` adds. `null` uses `irradiance`. A subclass overrides it.
      */
     protected roomIrradiance(_irradiance: Node<"vec3">, _iblIrradiance: Node<"vec3">): Node<"vec3"> | null;
-    /** @internal The build state that LilToonLightingModel reads. */
-    lightingHost(): LilToonLightingHost;
     setProperty(name: string, value: LilToonScalarOrVector): void;
     getProperty(name: string): number | number[] | undefined;
     setTexture(name: string, value: Texture | null): void;
@@ -153,18 +122,46 @@ declare class LilToonNodeMaterial extends NodeMaterial {
     protected setupNodes(): void;
 }
 
+type Float = Node<"float">;
+type Vec3 = Node<"vec3">;
+/**
+ * What the lighting model reads from its material while it builds. `setupLightingModel()` makes a new one for each
+ * build, so a later build of the same material does not change the state of a build that is still running.
+ */
+interface LilToonLightingHost {
+    /** The light nodes whose shadow AnalyticLightNode gave to `getShadow` instead of the light color. */
+    shadowed: ReadonlySet<object>;
+    features: ReadonlySet<keyof LilToonFeatureSet>;
+    hasTexture(name: string): boolean;
+    receivedShadow(shadow: Float): Float;
+    roomIrradiance(irradiance: Vec3, iblIrradiance: Vec3): Vec3 | null;
+}
+/**
+ * The lilToon lighting of LilToonNodeMaterial.
+ *
+ * Unity lilToon shades one main light (the directional light plus the SH ambient) with the bands. This model shades
+ * each three light with its own bands and sums them: `direct()` adds the light color × UNITY_LIGHT_SCALE to a summed
+ * light, and its bands × lilGray(light color) to a band sum. `finish()` divides the band sum by the summed weight
+ * and shades the summed light once, as lilGetShading shades the main light. With one light this is the Unity result.
+ */
+declare class LilToonLightingModel extends LightingModel {
+    #private;
+    readonly material: LilToonNodeMaterial;
+    constructor(material: LilToonNodeMaterial, host: LilToonLightingHost);
+    start(builder: NodeBuilder): void;
+    direct(input: LightingModelDirectInput): void;
+    indirect(builder: NodeBuilder): void;
+    finish(builder: NodeBuilder): void;
+}
+
 type Rgb = readonly [number, number, number];
 /**
  * The lilToon light color is the three light color times this scale. Task 10 calibrates it against the Unity
  * reference. The start value makes a three light of intensity PI a Unity light of intensity 1 (the Lambert 1 / PI).
  */
 declare const UNITY_LIGHT_SCALE: number;
-/**
- * The lilToon shadow band: 1 lit, 0 in shadow. `nl` is the half-Lambert value of lilHalfLambert.
- * lil_common_functions.hlsl:26-38 (lilTooningNoSaturateScale) and 77-85 (lilTooningScale), without the fwidth
- * anti-aliasing term of LIL_ANTIALIAS_MODE 1.
- */
-declare const lilBand: (nl: number, border: number, blur: number, borderRange?: number) => number;
+/** The lilToon shadow band: 1 lit, 0 in shadow. lil_common_functions.hlsl:77-85 (lilTooningScale). */
+declare const lilBand: (nl: number, border: number, blur: number, borderRange?: number, aa?: number) => number;
 /**
  * LIL_CORRECT_LIGHTCOLOR_VS without `_AsUnlit`, lil_common_macro.hlsl:2086-2087: the clamp to the light limits and the
  * monochrome mix.

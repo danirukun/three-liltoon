@@ -71,6 +71,9 @@ const FEATURE_PROPERTY: Record<keyof LilToonFeatureSet, string> = {
 	dissolve: "_DissolveParams",
 };
 
+/** Shadow types whose non-zero values the node path does not draw (lil_common_frag.hlsl:953-971, 1053-1061, 1072-1087). */
+const UNSUPPORTED_SHADOW_TYPES = ["_ShadowMaskType", "_ShadowColorType"];
+
 /** Properties the node path reads that the generated defaults do not list. */
 const NODE_EXTRA_DEFAULTS: Readonly<Record<string, readonly number[]>> = {
 	_MainTex_ST: [1, 1, 0, 0],
@@ -190,6 +193,22 @@ export function nodeWarnings(
 			shaderKey,
 			property,
 			message: `${property} is enabled, but the WebGPU material does not implement it. The model will load without this feature.`,
+		});
+	}
+	// Shadow variants the node path draws as type 0: the flat and face (SDF) mask types, and the LUT shadow color.
+	const shadowOn = enabledNodeFeatures(selection.variant, merged).includes(
+		"shadow",
+	);
+	for (const property of UNSUPPORTED_SHADOW_TYPES) {
+		const value = merged[property];
+		if (!shadowOn || typeof value !== "number" || value === 0) continue;
+		warnings.push({
+			severity: "warning",
+			code: "unsupported-feature",
+			materialName: name,
+			shaderKey,
+			property,
+			message: `${property} ${value} is not implemented for WebGPU. The material draws it as ${property} 0.`,
 		});
 	}
 	return warnings;

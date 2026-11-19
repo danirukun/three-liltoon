@@ -45,21 +45,77 @@ export const lilReceive = (
 ): number => ln * lerp(1, saturate(shadow), receive);
 
 /**
- * The lilToon shadow band: 1 lit, 0 in shadow. `nl` is the half-Lambert value of lilHalfLambert.
- * lil_common_functions.hlsl:26-38 (lilTooningNoSaturateScale) and 77-85 (lilTooningScale), without the fwidth
- * anti-aliasing term of LIL_ANTIALIAS_MODE 1.
+ * The lilToon shadow band before the saturate. `nl` is the half-Lambert value of lilHalfLambert. `aa` is the
+ * anti-aliasing term `fwidth(nl) * _AAStrength` of LIL_ANTIALIAS_MODE 1 (the lilToon default); 0 is mode 0.
+ * lil_common_functions.hlsl:57-69 (lilTooningNoSaturateScale with blur, and with borderRange).
  */
+export const lilBandNoSaturate = (
+	nl: number,
+	border: number,
+	blur: number,
+	borderRange = 0,
+	aa = 0,
+): number => {
+	const borderMin = saturate(border - blur * 0.5 - borderRange);
+	const borderMax = saturate(border + blur * 0.5);
+	return (
+		(nl - borderMin) /
+		Math.max(saturate(borderMax - borderMin + aa), BAND_EPSILON)
+	);
+};
+
+/** The lilToon shadow band: 1 lit, 0 in shadow. lil_common_functions.hlsl:77-85 (lilTooningScale). */
 export const lilBand = (
 	nl: number,
 	border: number,
 	blur: number,
 	borderRange = 0,
-): number => {
-	const borderMin = saturate(border - blur * 0.5 - borderRange);
-	const borderMax = saturate(border + blur * 0.5);
-	return saturate(
-		(nl - borderMin) / Math.max(saturate(borderMax - borderMin), BAND_EPSILON),
-	);
+	aa = 0,
+): number => saturate(lilBandNoSaturate(nl, border, blur, borderRange, aa));
+
+/** The AO shift of `_ShadowBorderMask`, lil_common_frag.hlsl:1011-1014. */
+export const lilAOShift = (
+	mask: Rgb,
+	shift: Rgba,
+	shift2: Rgba,
+): [number, number, number] => [
+	saturate(mask[0] * shift[0] + shift[1]),
+	saturate(mask[1] * shift[2] + shift[3]),
+	saturate(mask[2] * shift2[0] + shift2[1]),
+];
+
+export interface LilShadowBandsInput {
+	/** lns.xyz after the received shadow: first, second, third. */
+	ln: Rgb;
+	/** `_ShadowBorder`, `_Shadow2ndBorder`, `_Shadow3rdBorder`. */
+	border: Rgb;
+	/** `_ShadowBlur`, `_Shadow2ndBlur`, `_Shadow3rdBlur`. */
+	blur: Rgb;
+	/** The `_ShadowBlurMask` sample (rgb), 1 without a texture. */
+	blurMask: Rgb;
+	borderRange: number;
+	/** lilAOShift of the `_ShadowBorderMask` sample. */
+	ao: Rgb;
+	/** `_ShadowPostAO`. */
+	postAO: boolean;
+	/** `fwidth(value) * _AAStrength` of each value at the tooning, first, second, third. */
+	aa: Rgb;
+}
+
+/**
+ * The bands (x first, y second, z third, w first with `_ShadowBorderRange`), lil_common_frag.hlsl:983-1026: the blur
+ * mask (996-999), the AO border mask before (1016) or after (1025) the tooning, and the saturate (1026). Without a
+ * border mask texture the mask is 1, and this is the same as lines 1028-1033.
+ */
+export const lilShadowBands = (input: LilShadowBandsInput): Rgba => {
+	const { ao, postAO } = input;
+	const blur = mulRgb(input.blur, input.blurMask);
+	const ln = postAO ? input.ln : mulRgb(input.ln, ao);
+	const band = (i: number, range = 0) =>
+		lilBandNoSaturate(ln[i]!, input.border[i]!, blur[i]!, range, input.aa[i]!);
+	const bands = [band(0), band(1), band(2), band(0, input.borderRange)];
+	const post = postAO ? [ao[0], ao[1], ao[2], ao[0]] : [1, 1, 1, 1];
+	return bands.map((b, i) => saturate(b * post[i]!)) as unknown as Rgba;
 };
 
 /** lil_common_functions.hlsl:342-345. */
