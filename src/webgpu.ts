@@ -4,6 +4,15 @@ export {
 	type LilToonNodeMaterialParameters,
 } from "./webgpu/LilToonNodeMaterial.js";
 export {
+	LilToonLightingModel,
+	type LilToonLightingHost,
+} from "./webgpu/LilToonLightingModel.js";
+export {
+	UNITY_LIGHT_SCALE,
+	lilBand,
+	lilLimitLight,
+} from "./webgpu/lilToonMath.js";
+export {
 	LILTOON_NODE_FEATURES,
 	LILTOON_NODE_VARIANTS,
 	nodeProperties,

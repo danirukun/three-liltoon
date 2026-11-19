@@ -1,19 +1,26 @@
 import { Vector2, Vector3, Vector4 } from "three";
 import type { Texture } from "three";
-import { NodeMaterial, PhongLightingModel } from "three/webgpu";
+import { NodeMaterial } from "three/webgpu";
 import type {
 	LightingModel,
+	Node,
+	NodeBuilder,
 	TextureNode as TextureNodeType,
 	UniformNode,
 } from "three/webgpu";
-import { float, texture, uniform, uv, vec4 } from "three/tsl";
+import { context, float, texture, uniform, uv, vec4 } from "three/tsl";
 import { LILTOON_DEFAULTS } from "../generated/defaults.js";
+import type { LilToonFeatureSet } from "../material/LilToonFeatureSet.js";
 import type { LilToonShaderVariant } from "../material/shaderVariants.js";
 import type { LilToonWarning } from "../utils/materialWarnings.js";
 import {
 	getNeutralTexture,
 	normalizeLilToonTexture,
 } from "../utils/texture.js";
+import {
+	LilToonLightingModel,
+	type LilToonLightingHost,
+} from "./LilToonLightingModel.js";
 import {
 	LILTOON_NODE_FEATURES,
 	enabledNodeFeatures,
@@ -80,6 +87,7 @@ export class LilToonNodeMaterial extends NodeMaterial {
 	#textures: Record<string, Texture | null> = {};
 	#propertyNodes = new Map<string, PropertyNodes[PropertyType]>();
 	#textureNodes = new Map<string, TextureNode>();
+	#shadowed = new Set<object>();
 
 	constructor(parameters: LilToonNodeMaterialParameters = {}) {
 		super();
@@ -102,7 +110,52 @@ export class LilToonNodeMaterial extends NodeMaterial {
 
 	/** One overridable place for the lighting model. A subclass supplies its own. */
 	override setupLightingModel(): LightingModel {
-		return new PhongLightingModel(false);
+		return new LilToonLightingModel(this);
+	}
+
+	override setupLighting(builder: NodeBuilder): Node {
+		const shadowed = (this.#shadowed = new Set());
+		// r187 AnalyticLightNode.setupShadow multiplies the shadow into the light color unless the context has
+		// getShadow. The light nodes build after this method returns, so the hook goes into a context around the
+		// lighting. The model reads `lightNode.shadowNode` of each recorded light and folds it in as lilToon folds
+		// the attenuation.
+		const getShadow = (light: { baseColorNode: Node | null }) => {
+			shadowed.add(light);
+			return light.baseColorNode;
+		};
+		return context(super.setupLighting(builder), { getShadow });
+	}
+
+	/**
+	 * The cast shadow of one light, 1 lit and 0 in shadow, before `_ShadowReceive` folds it into the bands.
+	 * A subclass overrides it.
+	 */
+	protected receivedShadow(shadow: Node<"float">): Node<"float"> {
+		return shadow;
+	}
+
+	/**
+	 * The irradiance of the ambient term. `irradiance` is the scene ambient (ambient, hemisphere, and probe lights);
+	 * `iblIrradiance` is what `setupEnvironment()` adds. `null` uses `irradiance`. A subclass overrides it.
+	 */
+	protected roomIrradiance(
+		_irradiance: Node<"vec3">,
+		_iblIrradiance: Node<"vec3">,
+	): Node<"vec3"> | null {
+		return null;
+	}
+
+	/** @internal The build state that LilToonLightingModel reads. */
+	lightingHost(): LilToonLightingHost {
+		const features = new Set(this.#features());
+		return {
+			shadowed: this.#shadowed,
+			features,
+			hasTexture: (name) => this.#textures[name] != null,
+			receivedShadow: (shadow) => this.receivedShadow(shadow),
+			roomIrradiance: (irradiance, iblIrradiance) =>
+				this.roomIrradiance(irradiance, iblIrradiance),
+		};
 	}
 
 	setProperty(name: string, value: LilToonScalarOrVector): void {
@@ -211,10 +264,14 @@ export class LilToonNodeMaterial extends NodeMaterial {
 		else node.value = value;
 	}
 
-	#programKey(): string {
-		const features = enabledNodeFeatures(this.#variant, this.#properties)
+	#features(): (keyof LilToonFeatureSet)[] {
+		return enabledNodeFeatures(this.#variant, this.#properties)
 			.filter((feature) => LILTOON_NODE_FEATURES.has(feature))
 			.sort();
+	}
+
+	#programKey(): string {
+		const features = this.#features();
 		const present = Object.keys(this.#textures)
 			.filter((name) => this.#textures[name] !== null)
 			.sort();

@@ -1,6 +1,6 @@
 import { Vector2, Vector3, Vector4, SRGBColorSpace, LinearSRGBColorSpace, RepeatWrapping, DataTexture, RGBAFormat, UnsignedByteType, LinearFilter } from 'three';
-import { NodeMaterial, PhongLightingModel } from 'three/webgpu';
-import { texture, uv, vec4, float, uniform } from 'three/tsl';
+import { LightingModel, NodeMaterial } from 'three/webgpu';
+import { vec3, float, vec4, normalView, select, frontFacing, diffuseColor, mix, uv, max, context, texture, saturate as saturate$1, dot, clamp, min, uniform } from 'three/tsl';
 
 // src/webgpu/LilToonNodeMaterial.ts
 
@@ -1422,6 +1422,190 @@ function normalizeLilToonTexture(property, texture2) {
   return texture2;
 }
 
+// src/webgpu/lilToonMath.ts
+var UNITY_LIGHT_SCALE = 1 / Math.PI;
+var BAND_EPSILON = 1e-4;
+var saturate = (value) => Math.min(Math.max(value, 0), 1);
+var lerp = (a, b, t) => a + (b - a) * t;
+var lerpRgb = (a, b, t) => [0, 1, 2].map(
+  (i) => lerp(a[i], b[i], typeof t === "number" ? t : t[i])
+);
+var lilBand = (nl, border, blur, borderRange = 0) => {
+  const borderMin = saturate(border - blur * 0.5 - borderRange);
+  const borderMax = saturate(border + blur * 0.5);
+  return saturate(
+    (nl - borderMin) / Math.max(saturate(borderMax - borderMin), BAND_EPSILON)
+  );
+};
+var lilGray = (color) => (color[0] + color[1] + color[2]) / 3;
+var lilLimitLight = (color, min2, max2, monochrome) => {
+  const clamped = color.map((c) => Math.min(Math.max(c, min2), max2));
+  const gray = lilGray(clamped);
+  return lerpRgb(clamped, [gray, gray, gray], monochrome);
+};
+
+// src/webgpu/LilToonLightingModel.ts
+var tslHalfLambert = (nDotL) => saturate$1(nDotL.mul(0.5).add(0.5));
+var tslReceive = (ln, shadow, receive) => ln.mul(mix(float(1), saturate$1(shadow), receive));
+var tslBand = (nl, border, blur, borderRange = 0) => {
+  const borderMin = saturate$1(border.sub(blur.mul(0.5)).sub(borderRange));
+  const borderMax = saturate$1(border.add(blur.mul(0.5)));
+  return saturate$1(
+    nl.sub(borderMin).div(max(saturate$1(borderMax.sub(borderMin)), BAND_EPSILON))
+  );
+};
+var tslGray = (color) => dot(color, vec3(1 / 3));
+var tslLimitLight = (color, minLimit, maxLimit, monochrome) => {
+  const clamped = clamp(color, vec3(minLimit), vec3(maxLimit));
+  return mix(clamped, vec3(tslGray(clamped)), monochrome);
+};
+var tslShade = (input) => {
+  const { albedo, light, bands } = input;
+  const first = mix(float(1), bands.x, input.shadowStrength);
+  const tinted = (color, tex) => mix(albedo, tex.rgb, tex.a).mul(color);
+  let indirect = tinted(input.shadowColor, input.shadowColorTex);
+  indirect = mix(
+    indirect,
+    tinted(input.shadow2ndColor.rgb, input.shadow2ndColorTex),
+    input.shadow2ndColor.a.sub(bands.y.mul(input.shadow2ndColor.a))
+  );
+  if (input.shadow3rdColor)
+    indirect = mix(
+      indirect,
+      tinted(input.shadow3rdColor.rgb, input.shadow3rdColorTex),
+      input.shadow3rdColor.a.sub(bands.z.mul(input.shadow3rdColor.a))
+    );
+  indirect = mix(indirect, indirect.mul(albedo), input.shadowMainStrength);
+  const direct = albedo.mul(light);
+  indirect = indirect.mul(light);
+  indirect = mix(
+    indirect,
+    albedo,
+    saturate$1(input.environment.mul(input.shadowEnvStrength))
+  );
+  indirect = min(indirect, direct);
+  indirect = mix(indirect, direct, input.shadowBorderColor.mul(bands.w));
+  return mix(indirect, direct, first);
+};
+var LilToonLightingModel = class extends LightingModel {
+  material;
+  #host = null;
+  #light = vec3();
+  #weight = float();
+  #bands = vec4();
+  #ambient = vec3();
+  constructor(material) {
+    super();
+    this.material = material;
+  }
+  start(builder) {
+    this.#host = this.material.lightingHost();
+    this.#light = vec3().toVar("lilLight");
+    this.#weight = float().toVar("lilLightWeight");
+    this.#bands = vec4().toVar("lilBands");
+    this.#ambient = vec3().toVar("lilAmbient");
+    super.start(builder);
+  }
+  direct(input) {
+    const { lightDirection, lightColor } = input;
+    const host = this.#requireHost();
+    const color = lightColor.mul(UNITY_LIGHT_SCALE);
+    this.#light.addAssign(color);
+    if (!host.features.has("shadow")) return;
+    const p = this.#float;
+    const lightNode = input.lightNode;
+    const shadowNode = host.shadowed.has(lightNode) ? lightNode.shadowNode : null;
+    const shadow = shadowNode ? host.receivedShadow(shadowNode) : float(1);
+    const ln = tslHalfLambert(normalView.dot(lightDirection));
+    const ln1 = tslReceive(ln, shadow, p("_ShadowReceive"));
+    const ln2 = tslReceive(ln, shadow, p("_Shadow2ndReceive"));
+    const first = tslBand(ln1, p("_ShadowBorder"), p("_ShadowBlur"));
+    const second = tslBand(ln2, p("_Shadow2ndBorder"), p("_Shadow2ndBlur"));
+    const range = tslBand(
+      ln1,
+      p("_ShadowBorder"),
+      p("_ShadowBlur"),
+      p("_ShadowBorderRange")
+    );
+    const third = host.features.has("shadow3rd") ? tslBand(
+      tslReceive(ln, shadow, p("_Shadow3rdReceive")),
+      p("_Shadow3rdBorder"),
+      p("_Shadow3rdBlur")
+    ) : float(1);
+    const facing = select(
+      frontFacing,
+      float(1),
+      float(1).sub(p("_BackfaceForceShadow"))
+    );
+    const weight = tslGray(color);
+    this.#weight.addAssign(weight);
+    this.#bands.addAssign(
+      vec4(first, second, third, range).mul(facing).mul(weight)
+    );
+  }
+  indirect(builder) {
+    const { irradiance, iblIrradiance } = builder.context;
+    const host = this.#requireHost();
+    const room = host.roomIrradiance(irradiance, iblIrradiance) ?? irradiance;
+    this.#ambient.assign(room.mul(1 / Math.PI));
+  }
+  finish(builder) {
+    const host = this.#requireHost();
+    const p = this.#float;
+    const albedo = diffuseColor.rgb;
+    const asUnlit = p("_AsUnlit");
+    const light = mix(
+      tslLimitLight(
+        this.#light,
+        p("_LightMinLimit"),
+        p("_LightMaxLimit"),
+        p("_MonochromeLighting")
+      ),
+      vec3(1),
+      asUnlit
+    );
+    const lit = host.features.has("shadow") ? this.#shade(host, albedo, light) : albedo.mul(light);
+    const ambient = albedo.mul(this.#ambient).mul(float(1).sub(asUnlit));
+    const { outgoingLight } = builder.context;
+    outgoingLight.addAssign(lit.add(ambient));
+  }
+  #shade(host, albedo, light) {
+    const p = this.#float;
+    const v4 = (name) => this.material.propertyNode(name, "vec4");
+    const uvMain = uv().mul(v4("_MainTex_ST").xy).add(v4("_MainTex_ST").zw);
+    const sample = (name) => host.hasTexture(name) ? this.material.textureNode(name).sample(
+      uvMain
+    ) : vec4(0);
+    const bands = select(
+      this.#weight.greaterThan(0),
+      this.#bands.div(max(this.#weight, BAND_EPSILON)),
+      vec4(1)
+    );
+    return tslShade({
+      albedo,
+      light,
+      environment: this.#ambient,
+      bands,
+      shadowStrength: p("_ShadowStrength"),
+      shadowColor: v4("_ShadowColor").rgb,
+      shadowColorTex: sample("_ShadowColorTex"),
+      shadow2ndColor: v4("_Shadow2ndColor"),
+      shadow2ndColorTex: sample("_Shadow2ndColorTex"),
+      shadow3rdColor: host.features.has("shadow3rd") ? v4("_Shadow3rdColor") : null,
+      shadow3rdColorTex: sample("_Shadow3rdColorTex"),
+      shadowMainStrength: p("_ShadowMainStrength"),
+      shadowEnvStrength: p("_ShadowEnvStrength"),
+      shadowBorderColor: v4("_ShadowBorderColor").rgb
+    });
+  }
+  #float = (name) => this.material.propertyNode(name, "float");
+  #requireHost() {
+    if (!this.#host)
+      throw new Error("LilToonLightingModel.start was not called");
+    return this.#host;
+  }
+};
+
 // src/material/shaderVariants.ts
 var shaderVariants = {
   lilToon: ["opaque", "normal", false],
@@ -1643,6 +1827,7 @@ var LilToonNodeMaterial = class extends NodeMaterial {
   #textures = {};
   #propertyNodes = /* @__PURE__ */ new Map();
   #textureNodes = /* @__PURE__ */ new Map();
+  #shadowed = /* @__PURE__ */ new Set();
   constructor(parameters = {}) {
     super();
     this.lights = true;
@@ -1662,7 +1847,40 @@ var LilToonNodeMaterial = class extends NodeMaterial {
   }
   /** One overridable place for the lighting model. A subclass supplies its own. */
   setupLightingModel() {
-    return new PhongLightingModel(false);
+    return new LilToonLightingModel(this);
+  }
+  setupLighting(builder) {
+    const shadowed = this.#shadowed = /* @__PURE__ */ new Set();
+    const getShadow = (light) => {
+      shadowed.add(light);
+      return light.baseColorNode;
+    };
+    return context(super.setupLighting(builder), { getShadow });
+  }
+  /**
+   * The cast shadow of one light, 1 lit and 0 in shadow, before `_ShadowReceive` folds it into the bands.
+   * A subclass overrides it.
+   */
+  receivedShadow(shadow) {
+    return shadow;
+  }
+  /**
+   * The irradiance of the ambient term. `irradiance` is the scene ambient (ambient, hemisphere, and probe lights);
+   * `iblIrradiance` is what `setupEnvironment()` adds. `null` uses `irradiance`. A subclass overrides it.
+   */
+  roomIrradiance(_irradiance, _iblIrradiance) {
+    return null;
+  }
+  /** @internal The build state that LilToonLightingModel reads. */
+  lightingHost() {
+    const features = new Set(this.#features());
+    return {
+      shadowed: this.#shadowed,
+      features,
+      hasTexture: (name) => this.#textures[name] != null,
+      receivedShadow: (shadow) => this.receivedShadow(shadow),
+      roomIrradiance: (irradiance, iblIrradiance) => this.roomIrradiance(irradiance, iblIrradiance)
+    };
   }
   setProperty(name, value) {
     const before = this.#programKey();
@@ -1755,8 +1973,11 @@ var LilToonNodeMaterial = class extends NodeMaterial {
     if (Array.isArray(value)) node.value.fromArray(value);
     else node.value = value;
   }
+  #features() {
+    return enabledNodeFeatures(this.#variant, this.#properties).filter((feature) => LILTOON_NODE_FEATURES.has(feature)).sort();
+  }
   #programKey() {
-    const features = enabledNodeFeatures(this.#variant, this.#properties).filter((feature) => LILTOON_NODE_FEATURES.has(feature)).sort();
+    const features = this.#features();
     const present = Object.keys(this.#textures).filter((name) => this.#textures[name] !== null).sort();
     return `${this.#variant}|${features.join(",")}|${present.join(",")}`;
   }
@@ -1789,4 +2010,4 @@ var GLTFLilToonNodeExtension = class {
 var enableLilToonNodeVRM = () => {
 };
 
-export { GLTFLilToonNodeExtension, LILTOON_NODE_FEATURES, LILTOON_NODE_VARIANTS, LilToonNodeMaterial, enableLilToonNodeVRM, nodeProperties, nodeVariant, nodeWarnings };
+export { GLTFLilToonNodeExtension, LILTOON_NODE_FEATURES, LILTOON_NODE_VARIANTS, LilToonLightingModel, LilToonNodeMaterial, UNITY_LIGHT_SCALE, enableLilToonNodeVRM, lilBand, lilLimitLight, nodeProperties, nodeVariant, nodeWarnings };
