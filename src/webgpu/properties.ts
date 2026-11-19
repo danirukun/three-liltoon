@@ -1,0 +1,196 @@
+import {
+	LILTOON_DEFAULTS,
+	LILTOON_MODE_DEFAULTS,
+} from "../generated/defaults.js";
+import {
+	detectLilToonFeatures,
+	type LilToonFeatureSet,
+} from "../material/LilToonFeatureSet.js";
+import {
+	isShaderVariant,
+	shaderVariants,
+	type LilToonShaderVariant,
+} from "../material/shaderVariants.js";
+import type { LilToonWarning } from "../utils/materialWarnings.js";
+import type { Color, Texture, Vector2, Vector3, Vector4 } from "three";
+
+// Same shape as the WebGL material type. That module name is banned in src/webgpu.
+export type LilToonScalarOrVector =
+	number | boolean | number[] | Color | Vector2 | Vector3 | Vector4;
+export type LilToonNodeValue = number | number[];
+export type LilToonNodeMode = "opaque" | "cutout" | "transparent";
+
+export interface LilToonNodeVariant {
+	variant: LilToonShaderVariant;
+	mode: LilToonNodeMode;
+	outline: boolean;
+	warning: string | null;
+}
+
+/** Features the node material draws. Any other enabled feature gives a warning. */
+export const LILTOON_NODE_FEATURES: ReadonlySet<keyof LilToonFeatureSet> =
+	new Set<keyof LilToonFeatureSet>([
+		"shadow",
+		"shadow3rd",
+		"normal1st",
+		"matcap",
+		"rim",
+		"emission1st",
+		"backlight",
+		"outline",
+	]);
+
+export const LILTOON_NODE_VARIANTS: ReadonlySet<LilToonShaderVariant> =
+	new Set<LilToonShaderVariant>([
+		"lilToon",
+		"Hidden/lilToonOutline",
+		"Hidden/lilToonCutout",
+		"Hidden/lilToonCutoutOutline",
+		"Hidden/lilToonTransparent",
+		"Hidden/lilToonTransparentOutline",
+		"Hidden/lilToonOnePassTransparent",
+		"Hidden/lilToonOnePassTransparentOutline",
+	]);
+
+const FEATURE_PROPERTY: Record<keyof LilToonFeatureSet, string> = {
+	main2nd: "_UseMain2ndTex",
+	main3rd: "_UseMain3rdTex",
+	shadow: "_UseShadow",
+	shadow3rd: "_UseShadow",
+	normal1st: "_UseBumpMap",
+	normal2nd: "_UseBump2ndMap",
+	matcap: "_UseMatCap",
+	matcap2nd: "_UseMatCap2nd",
+	rim: "_UseRim",
+	emission1st: "_UseEmission",
+	emission2nd: "_UseEmission2nd",
+	reflection: "_UseReflection",
+	anisotropy: "_UseAnisotropy",
+	backlight: "_UseBacklight",
+	outline: "shaderVariant",
+	dissolve: "_DissolveParams",
+};
+
+/** Properties the node path reads that the generated defaults do not list. */
+const NODE_EXTRA_DEFAULTS: Readonly<Record<string, readonly number[]>> = {
+	_MainTex_ST: [1, 1, 0, 0],
+};
+
+export function nodeVariant(name: string | undefined): LilToonNodeVariant {
+	if (name === undefined)
+		return {
+			variant: "lilToon",
+			mode: "opaque",
+			outline: false,
+			warning: null,
+		};
+	if (!isShaderVariant(name))
+		return {
+			variant: "lilToon",
+			mode: "opaque",
+			outline: false,
+			warning: `Unknown lilToon shader ${name}. The material uses lilToon.`,
+		};
+	const [renderMode, , outline] = shaderVariants[name];
+	if (LILTOON_NODE_VARIANTS.has(name))
+		return {
+			variant: name,
+			mode: renderMode as LilToonNodeMode,
+			outline,
+			warning: null,
+		};
+	return {
+		variant: "lilToon",
+		mode: "opaque",
+		outline,
+		warning: `${name} is not implemented for WebGPU. The material uses lilToon.`,
+	};
+}
+
+const toArray = (value: LilToonScalarOrVector): LilToonNodeValue => {
+	if (typeof value === "boolean") return value ? 1 : 0;
+	if (typeof value === "number") return value;
+	if (Array.isArray(value)) return [...value];
+	if ("isColor" in value) return [value.r, value.g, value.b];
+	return value.toArray();
+};
+
+/** Convert to a number or array. A short array keeps the rest of the template. */
+export function normalizeNodeValue(
+	value: LilToonScalarOrVector,
+	template?: LilToonNodeValue,
+): LilToonNodeValue {
+	const result = toArray(value);
+	if (Array.isArray(result) && Array.isArray(template))
+		for (let i = result.length; i < template.length; i++)
+			result.push(template[i]!);
+	return result;
+}
+
+const modeDefaults = (mode: string): Record<string, LilToonNodeValue> => {
+	const defaults: Record<string, LilToonNodeValue> = {};
+	const sources: Record<string, unknown>[] = [
+		LILTOON_DEFAULTS,
+		LILTOON_MODE_DEFAULTS[mode] ?? {},
+		NODE_EXTRA_DEFAULTS,
+	];
+	for (const source of sources)
+		for (const [name, value] of Object.entries(source))
+			if (typeof value === "number" || Array.isArray(value))
+				defaults[name] = Array.isArray(value) ? [...value] : value;
+	return defaults;
+};
+
+export function nodeProperties(
+	variant: LilToonShaderVariant,
+	properties: Record<string, LilToonScalarOrVector>,
+): Record<string, LilToonNodeValue> {
+	const result = modeDefaults(shaderVariants[variant][0]);
+	for (const [name, value] of Object.entries(properties))
+		result[name] = normalizeNodeValue(value, result[name]);
+	return result;
+}
+
+export function enabledNodeFeatures(
+	variant: LilToonShaderVariant,
+	properties: Record<string, LilToonNodeValue>,
+): (keyof LilToonFeatureSet)[] {
+	const features = detectLilToonFeatures(properties as never, variant);
+	return (Object.keys(features) as (keyof LilToonFeatureSet)[]).filter(
+		(name) => features[name],
+	);
+}
+
+export function nodeWarnings(
+	name: string,
+	properties: Record<string, LilToonScalarOrVector>,
+	_textures: Record<string, Texture | null>,
+	shaderVariant?: string,
+): LilToonWarning[] {
+	const selection = nodeVariant(shaderVariant);
+	const shaderKey = shaderVariant ?? selection.variant;
+	const warnings: LilToonWarning[] = [];
+	if (selection.warning)
+		warnings.push({
+			severity: "warning",
+			code: "unsupported-shader-variant",
+			materialName: name,
+			shaderKey,
+			property: "shaderVariant",
+			message: selection.warning,
+		});
+	const merged = nodeProperties(selection.variant, properties);
+	for (const feature of enabledNodeFeatures(selection.variant, merged)) {
+		if (LILTOON_NODE_FEATURES.has(feature)) continue;
+		const property = FEATURE_PROPERTY[feature];
+		warnings.push({
+			severity: "warning",
+			code: "unsupported-feature",
+			materialName: name,
+			shaderKey,
+			property,
+			message: `${property} is enabled, but the WebGPU material does not implement it. The model will load without this feature.`,
+		});
+	}
+	return warnings;
+}
