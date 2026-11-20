@@ -181,8 +181,10 @@ interface LilToonLightingHost {
  *
  * Unity lilToon shades one main light (the directional light plus the SH ambient) with the bands. This model shades
  * each three light with its own bands and sums them: `direct()` adds the light color × UNITY_LIGHT_SCALE to a summed
- * light, and its bands × lilGray(light color) to a band sum. `finish()` divides the band sum by the summed weight
- * and shades the summed light once, as lilGetShading shades the main light. With one light this is the Unity result.
+ * light, and its bands × lilGray(light color) to a band sum. `indirect()` keeps the ambient (the scene irradiance, or
+ * what the roomIrradiance hook returns, over π). `finish()` divides the band sum by the summed weight, adds the
+ * ambient to the summed light, limits that light color once, and shades it, as lilGetShading shades the main light.
+ * With one light this is the Unity result.
  * The backlight factor of each light has the same weight. Rim light, matcap, and emission do not depend on the light
  * direction; `finish()` applies them once to the shaded color, with the summed light, as lilToon does.
  */

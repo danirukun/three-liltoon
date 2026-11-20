@@ -230,8 +230,10 @@ export const tslShade = (input: TslShadeInput): Vec3 => {
  *
  * Unity lilToon shades one main light (the directional light plus the SH ambient) with the bands. This model shades
  * each three light with its own bands and sums them: `direct()` adds the light color × UNITY_LIGHT_SCALE to a summed
- * light, and its bands × lilGray(light color) to a band sum. `finish()` divides the band sum by the summed weight
- * and shades the summed light once, as lilGetShading shades the main light. With one light this is the Unity result.
+ * light, and its bands × lilGray(light color) to a band sum. `indirect()` keeps the ambient (the scene irradiance, or
+ * what the roomIrradiance hook returns, over π). `finish()` divides the band sum by the summed weight, adds the
+ * ambient to the summed light, limits that light color once, and shades it, as lilGetShading shades the main light.
+ * With one light this is the Unity result.
  * The backlight factor of each light has the same weight. Rim light, matcap, and emission do not depend on the light
  * direction; `finish()` applies them once to the shaded color, with the summed light, as lilToon does.
  */
@@ -370,7 +372,8 @@ export class LilToonLightingModel extends LightingModel {
 		const { irradiance, iblIrradiance } = builder.context as unknown as Context;
 		const room =
 			this.#host.roomIrradiance(irradiance, iblIrradiance) ?? irradiance;
-		// The ambient in lilToon light units: BRDF_Lambert, irradiance / PI, as the MToon indirectDiffuse.
+		// The ambient in lilToon light units: BRDF_Lambert, irradiance / PI, as the MToon indirectDiffuse. finish() adds
+		// it to the summed light before the light limit, as the SH ambient of lilGetLightColor.
 		this.#ambient.assign(room.mul(1 / Math.PI));
 	}
 
@@ -393,7 +396,9 @@ export class LilToonLightingModel extends LightingModel {
 				vec3(1),
 				asUnlit,
 			);
-		// fd.lightColor of the effects: Unity lilToon adds the SH ambient to the main light before the limit.
+		// fd.lightColor: the main light plus the SH ambient as one value (lilGetLightColor, lil_common_functions.hlsl:999),
+		// then one light limit (lil_common_macro.hlsl:2081-2088). The ambient is inside the limit for the shading, the
+		// effects, and the outline, and `_AsUnlit` (the lerp to 1 of the limit) removes it with the light.
 		const lightColor = limit(this.#light.add(this.#ambient));
 		const { outgoingLight } = builder.context as unknown as Context;
 		if (host.outline) {
@@ -403,15 +408,10 @@ export class LilToonLightingModel extends LightingModel {
 			);
 			return;
 		}
-		const light = limit(this.#light);
 		// lil_common_frag.hlsl:1137 without `_UseShadow`.
-		const lit = features.has("shadow")
-			? this.#shade(albedo, light)
-			: albedo.mul(light);
-		// Unity lilToon adds the SH ambient to the main light before the limit. Here it is a separate Lambert term,
-		// so a subclass can change it through roomIrradiance(). `_AsUnlit` removes it, as the lerp to 1 does in Unity.
-		const ambient = albedo.mul(this.#ambient).mul(float(1).sub(asUnlit));
-		let col: Vec3 = lit.add(ambient);
+		let col: Vec3 = features.has("shadow")
+			? this.#shade(albedo, lightColor)
+			: albedo.mul(lightColor);
 		const surface: LilToonSurface = {
 			inputs: this.#inputs,
 			albedo,
@@ -471,7 +471,9 @@ export class LilToonLightingModel extends LightingModel {
 		return tslShade({
 			albedo,
 			light,
-			environment: this.#ambient,
+			// fd.indLightColor = saturate(shMin) (lil_common_functions.hlsl:1022): the ambient before the light limit,
+			// read by `_ShadowEnvStrength` only (lil_common_frag.hlsl:1125).
+			environment: saturate(this.#ambient),
 			bands,
 			// lil_common_frag.hlsl:1049 and 1064 (`_ShadowMaskType` 0).
 			shadowStrength: p("_ShadowStrength").mul(

@@ -1864,10 +1864,7 @@ var LilToonLightingModel = class extends LightingModel {
       );
       return;
     }
-    const light = limit(this.#light);
-    const lit = features.has("shadow") ? this.#shade(albedo, light) : albedo.mul(light);
-    const ambient = albedo.mul(this.#ambient).mul(float(1).sub(asUnlit));
-    let col = lit.add(ambient);
+    let col = features.has("shadow") ? this.#shade(albedo, lightColor) : albedo.mul(lightColor);
     const surface = {
       inputs: this.#inputs,
       albedo,
@@ -1918,7 +1915,9 @@ var LilToonLightingModel = class extends LightingModel {
     return tslShade({
       albedo,
       light,
-      environment: this.#ambient,
+      // fd.indLightColor = saturate(shMin) (lil_common_functions.hlsl:1022): the ambient before the light limit,
+      // read by `_ShadowEnvStrength` only (lil_common_frag.hlsl:1125).
+      environment: saturate$1(this.#ambient),
       bands,
       // lil_common_frag.hlsl:1049 and 1064 (`_ShadowMaskType` 0).
       shadowStrength: p("_ShadowStrength").mul(

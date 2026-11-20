@@ -18,7 +18,10 @@ const fakeContext = () => ({
 	outgoingLight: vec3().toVar(),
 });
 
-export type StackEntry = { targetNode?: Node & { name?: string }; sourceNode?: Node };
+export type StackEntry = {
+	targetNode?: Node & { name?: string };
+	sourceNode?: Node;
+};
 
 export const runModel = (
 	source: LilToonNodeMaterial | LilToonLightingModel,
@@ -87,18 +90,52 @@ export const getShadowOf = (material: LilToonNodeMaterial) => {
 	return node.value.getShadow;
 };
 
-/** Whether the node graph under `root` has `target`, or a node that `target` accepts. */
+/**
+ * Whether the node graph under `root` has `target`, or a node that `target` accepts. The search does not go into a
+ * node that `skip` accepts.
+ */
 export const contains = (
 	root: Node | null | undefined,
 	target: Node | ((node: Node) => boolean),
+	skip: (node: Node) => boolean = () => false,
 ): boolean => {
 	const test =
 		typeof target === "function" ? target : (node: Node) => node === target;
 	const seen = new Set<Node>();
 	const visit = (node: Node | null | undefined): boolean => {
-		if (!node || seen.has(node)) return false;
+		if (!node || seen.has(node) || skip(node)) return false;
 		seen.add(node);
 		return test(node) || node.getChildren().some(visit);
 	};
 	return visit(root);
+};
+
+/** The nodes of the graph under `root` that `match` accepts, each once. */
+export const collect = (
+	root: Node | null | undefined,
+	match: (node: Node) => boolean,
+): Node[] => {
+	const found: Node[] = [];
+	contains(root, (node) => {
+		if (match(node)) found.push(node);
+		return false;
+	});
+	return found;
+};
+
+/**
+ * The light-limit clamps of a graph: `lilLimitLight` clamps the light color between `_LightMinLimit` and
+ * `_LightMaxLimit`. `saturate` is a clamp too, so the clamp must read the `_LightMinLimit` uniform of the material.
+ */
+export const limitClampsIn = (
+	root: Node | null | undefined,
+	material: LilToonNodeMaterial,
+) => {
+	const minLimit = material.propertyNode("_LightMinLimit", "float");
+	return collect(
+		root,
+		(node) =>
+			(node as { method?: string }).method === "clamp" &&
+			contains((node as { bNode?: Node }).bNode, minLimit),
+	) as (Node & { aNode: Node })[];
 };

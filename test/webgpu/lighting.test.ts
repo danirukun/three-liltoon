@@ -4,7 +4,14 @@ import { float, vec3 } from "three/tsl";
 import { describe, expect, it } from "vitest";
 import { LilToonLightingModel } from "../../src/webgpu/LilToonLightingModel";
 import { LilToonNodeMaterial } from "../../src/webgpu/LilToonNodeMaterial";
-import { getShadowOf, runModel, type Light } from "./fakeLighting";
+import {
+	limitClampsIn,
+	contains,
+	getShadowOf,
+	runModel,
+	type Light,
+	type StackEntry,
+} from "./fakeLighting";
 
 describe("LilToonLightingModel", () => {
 	it("is the lighting model of the material and holds it", () => {
@@ -155,6 +162,70 @@ describe("LilToonLightingModel", () => {
 		expect(() =>
 			runModel(material, [{ shadowNode: null, baseColorNode: null }]),
 		).not.toThrow();
+	});
+
+	// The variable that one assignment of runModel writes, by its name.
+	const variable = (entries: StackEntry[], name: string) =>
+		entries.find((entry) => entry.targetNode?.name === name)!.targetNode!;
+
+	it("limits the summed light with the ambient inside the limit, once", () => {
+		// lil_common_functions.hlsl:999 and lil_common_macro.hlsl:2081-2088: lightColor = main light + SH ambient, then
+		// one clamp between _LightMinLimit and _LightMaxLimit. The ambient is not a second term outside the limit.
+		const light: Light = { shadowNode: null, baseColorNode: null };
+		const material = new LilToonNodeMaterial();
+		const plain = runModel(material, [light]);
+		const clamps = limitClampsIn(plain.outgoing, material);
+		expect(clamps).toHaveLength(1);
+		expect(
+			contains(clamps[0]!.aNode, variable(plain.entries, "lilLight")),
+		).toBe(true);
+		expect(
+			contains(clamps[0]!.aNode, variable(plain.entries, "lilAmbient")),
+		).toBe(true);
+		const outsideTheLimit = contains(
+			plain.outgoing,
+			variable(plain.entries, "lilAmbient"),
+			(node) => node === clamps[0],
+		);
+		expect(outsideTheLimit).toBe(false);
+	});
+
+	it("gives the shading, the effects, and the outline the same limited light color", () => {
+		const light: Light = { shadowNode: null, baseColorNode: null };
+		const material = new LilToonNodeMaterial({
+			shaderVariant: "Hidden/lilToonOutline",
+			properties: {
+				_UseShadow: 1,
+				_UseRim: 1,
+				_UseMatCap: 1,
+				_UseBacklight: 1,
+			},
+		});
+		const surface = runModel(material, [light]);
+		const clamps = limitClampsIn(surface.outgoing, material);
+		expect(clamps).toHaveLength(1);
+		expect(
+			contains(clamps[0]!.aNode, variable(surface.entries, "lilAmbient")),
+		).toBe(true);
+		// fd.indLightColor × _ShadowEnvStrength is the only other read of the ambient (lil_common_frag.hlsl:1125).
+		const envStrength = material.propertyNode("_ShadowEnvStrength", "float");
+		const outsideTheLimit = contains(
+			surface.outgoing,
+			variable(surface.entries, "lilAmbient"),
+			(node) => node === clamps[0] || node.getChildren().includes(envStrength),
+		);
+		expect(outsideTheLimit).toBe(false);
+		const outline = material.clone();
+		outline.isOutline = true;
+		const pass = runModel(outline, [light]);
+		const outlineClamps = limitClampsIn(pass.outgoing, outline);
+		expect(outlineClamps).toHaveLength(1);
+		expect(
+			contains(outlineClamps[0]!.aNode, variable(pass.entries, "lilAmbient")),
+		).toBe(true);
+		expect(
+			contains(outlineClamps[0]!.aNode, variable(pass.entries, "lilLight")),
+		).toBe(true);
 	});
 
 	it("only sums the light without _UseShadow", () => {
