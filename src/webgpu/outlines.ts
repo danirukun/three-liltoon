@@ -30,7 +30,7 @@ const prepareGroups = (geometry: BufferGeometry): boolean => {
 /**
  * Give each mesh with an outline lilToon material a second material that draws the outline, as three-vrm 3.5.5
  * MToonMaterialLoaderPlugin._generateOutline does: `mesh.material = [surface, outline]`, with one geometry group for
- * each material. The outline is a clone of the surface with `isOutline` true and the back side. The material keys on
+ * each material. The outline is a clone of the surface with `isOutline` true, which also sets the back side. The material keys on
  * the outline flag of the shader variant, not on `_OutlineWidth`. A mesh whose material is already an array is left
  * unchanged, so a second call does nothing. three-vrm draws a third of the index count; this draws all of it, so the
  * count is correct for a geometry without an index too.
@@ -48,8 +48,12 @@ export function generateLilToonOutlines(root: Object3D): void {
 		if (!outline) {
 			outline = surface.clone();
 			outline.name = `${surface.name} (Outline)`;
+			// The setter sets the back side (lil_pass_forward_normal.hlsl, Cull Front).
 			outline.isOutline = true;
-			outline.side = BackSide;
+			// The shadow pass draws the outline at the surface position (its positionNode is null), so it draws the
+			// back side as the surface does. The default shadow side of BackSide is FrontSide, which puts the front
+			// faces into the shadow map at the surface depth.
+			outline.shadowSide = BackSide;
 			outlines.set(surface, outline);
 		}
 		object.material = [surface, outline];

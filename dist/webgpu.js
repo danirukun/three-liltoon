@@ -1,6 +1,6 @@
 import { BackSide, FrontSide, DoubleSide, Vector2, Vector3, Vector4, SRGBColorSpace, LinearSRGBColorSpace, RepeatWrapping, DataTexture, RGBAFormat, UnsignedByteType, LinearFilter } from 'three';
 import { LightingModel, NodeMaterial } from 'three/webgpu';
-import { positionLocal, uv, select, max, mix, pow, saturate as saturate$1, dot, positionViewDirection, normalize, float, abs, sqrt, modelWorldMatrix, vec4, length, cameraPosition, normalLocal, vec3, negateOnBackSide, normalViewGeometry, normalView, frontFacing, diffuseColor, vec2, dFdx, dFdy, context, texture, normalMap, fwidth, faceDirection, cameraProjectionMatrix, cameraViewMatrix, cross, sin, time, round, min, uniform, clamp } from 'three/tsl';
+import { positionLocal, uv, select, max, mix, pow, saturate as saturate$1, dot, positionViewDirection, normalize, float, abs, sqrt, modelWorldMatrix, vec4, length, cameraPosition, normalLocal, vec3, normalView, normalViewGeometry, frontFacing, diffuseColor, vec2, dFdx, dFdy, context, texture, normalMap, fwidth, faceDirection, cameraProjectionMatrix, cameraViewMatrix, cross, sin, time, round, min, uniform, clamp } from 'three/tsl';
 
 // src/webgpu/LilToonNodeMaterial.ts
 
@@ -1479,6 +1479,14 @@ var tslBlendColor = (dst, src, srcA, mode) => {
   return mix(dst, out, srcA);
 };
 var tslBackfaceMask = (value, mask) => select(faceDirection.lessThan(mask.sub(1)), float(0), value);
+var tslFaceNormal = (normal, flipNormal) => {
+  const unflipped = normal.mul(faceDirection);
+  return select(
+    faceDirection.lessThan(flipNormal.sub(1)),
+    unflipped.negate(),
+    unflipped
+  );
+};
 var tslNormalByStrength = (normal, geometryNormal, strength) => geometryNormal ? mix(geometryNormal, normal, strength) : normal;
 var tslTooning = (inputs, value, border, blur) => tslBand(
   value,
@@ -1613,7 +1621,7 @@ var tslBlink = (blink) => {
 var tslEmission = (col, s) => {
   const { inputs } = s;
   const p = inputs.float;
-  const color = inputs.vec4("_EmissionColor").mul(tslSampleST(inputs, "_EmissionMap", uv())).mul(tslSampleST(inputs, "_EmissionBlendMask", inputs.uvMain));
+  const color = inputs.vec4("_EmissionColor").mul(tslSampleST(inputs, "_EmissionMap", uv())).mul(tslSampleST(inputs, "_EmissionBlendMask", uv()));
   const invLighting = saturate$1(s.lightColor.oneMinus().mul(sqrt(s.lightColor)));
   const fluorescent = mix(
     color.rgb,
@@ -1643,9 +1651,8 @@ var tslOutlinePosition = (inputs, position = positionLocal) => {
   return position.add(normalize(normalLocal).mul(width));
 };
 var tslOutlineColor = (inputs) => {
-  const texture2 = inputs.texture("_OutlineTex");
   const color = inputs.vec4("_OutlineColor");
-  return texture2 ? texture2.sample(inputs.uvMain).mul(color) : color;
+  return inputs.texture("_OutlineTex") ? tslSampleST(inputs, "_OutlineTex", uv()).mul(color) : color;
 };
 var tslOutlineLight = (albedo, lightColor, enable) => mix(albedo, albedo.mul(lightColor), enable);
 
@@ -1732,14 +1739,20 @@ var LilToonLightingModel = class extends LightingModel {
   #blurMask = vec4(1);
   #borderMask = vec4(1);
   #inputs;
-  /** fd.origN with a normal map. three negates the normal of a back face, so origN gets the same sign. */
+  /** fd.N: the three normal without the back-face negation, then `_FlipNormal` (tslFaceNormal). */
+  #normalN;
+  /**
+   * fd.origN with a normal map: `normalize(input.normalWS)` (lil_pass_forward_normal.hlsl:311), not negated on a back
+   * face and not changed by `_FlipNormal`.
+   */
   #geometryNormal;
   constructor(material, host) {
     super();
     this.material = material;
     this.#host = host;
     this.#inputs = lilToonShadingInputs(material, host.hasTexture);
-    this.#geometryNormal = host.normalMapped ? negateOnBackSide(normalViewGeometry) : null;
+    this.#normalN = tslFaceNormal(normalView, this.#float("_FlipNormal"));
+    this.#geometryNormal = host.normalMapped ? normalViewGeometry : null;
   }
   start(builder) {
     this.#light = vec3().toVar("lilLight");
@@ -1788,7 +1801,7 @@ var LilToonLightingModel = class extends LightingModel {
     const p = this.#float;
     const v4 = this.#vec4;
     const third = this.#host.features.has("shadow3rd");
-    const plain = tslHalfLambert(normalView.dot(lightDirection));
+    const plain = tslHalfLambert(this.#normalN.dot(lightDirection));
     const ln = (strength) => this.#geometryNormal ? tslHalfLambert(this.#normal(strength).dot(lightDirection)) : plain;
     const receive = (strength, name) => tslReceive(ln(strength), shadow, p(name));
     const bands = tslShadowBands({
@@ -1863,7 +1876,7 @@ var LilToonLightingModel = class extends LightingModel {
       lightColor,
       // lil_common_frag.hlsl:1050: fd.shadowmix = lns.x before `_ShadowStrength`.
       shadowmix: features.has("shadow") ? this.#normalizedBands().x : float(1),
-      normal: normalView,
+      normal: this.#normalN,
       geometryNormal: this.#geometryNormal
     };
     if (features.has("backlight"))
@@ -1892,7 +1905,7 @@ var LilToonLightingModel = class extends LightingModel {
   /** fd.N mixed toward fd.origN by one normal strength property, fd.N without a normal map. */
   #normal(strength) {
     return tslNormalByStrength(
-      normalView,
+      this.#normalN,
       this.#geometryNormal,
       this.#float(strength)
     );
@@ -2063,7 +2076,8 @@ var NODE_EXTRA_DEFAULTS = {
   _RimColorTex_ST: IDENTITY_ST,
   _BacklightColorTex_ST: IDENTITY_ST,
   _EmissionMap_ST: IDENTITY_ST,
-  _EmissionBlendMask_ST: IDENTITY_ST
+  _EmissionBlendMask_ST: IDENTITY_ST,
+  _OutlineTex_ST: IDENTITY_ST
 };
 function nodeVariant(name) {
   if (name === void 0)
@@ -2224,11 +2238,7 @@ var CULL_SIDE = {
 };
 var LilToonNodeMaterial = class extends NodeMaterial {
   isLilToonNodeMaterial = true;
-  /**
-   * The material draws the outline pass: generateLilToonOutlines sets it on the clone it makes. The build reads it,
-   * so set it before the first draw.
-   */
-  isOutline = false;
+  #isOutline = false;
   #variant = "lilToon";
   #outline = false;
   #mode = "opaque";
@@ -2255,6 +2265,19 @@ var LilToonNodeMaterial = class extends NodeMaterial {
   }
   get variant() {
     return this.#variant;
+  }
+  /**
+   * The material draws the outline pass: generateLilToonOutlines sets it on the clone it makes. A change sets the
+   * side (BackSide for the outline, `_Cull` for the surface) and rebuilds the program.
+   */
+  get isOutline() {
+    return this.#isOutline;
+  }
+  set isOutline(value) {
+    if (value === this.#isOutline) return;
+    this.#isOutline = value;
+    this.#applyCull();
+    this.needsUpdate = true;
   }
   /** The requested shader has an outline pass, also when the material falls back to lilToon. */
   get hasOutline() {
@@ -2409,19 +2432,23 @@ var LilToonNodeMaterial = class extends NodeMaterial {
   }
   /**
    * The normal: lilUnpackNormalScale of `_BumpMap` with `_BumpScale` (lil_common_frag.hlsl:870-881) through the
-   * three tangent frame. Without tangents, NormalMapNode uses the derivative frame. It does not assign
-   * `normalNode`, so a user normalNode and a later build without the map keep working.
+   * three tangent frame. Without a `tangent` attribute, NormalMapNode uses the derivative frame, and the textures
+   * have flipY false, so Y is negated as GLTFLoader negates `normalScale.y` (GLTFLoader.js:3642-3645). The geometry
+   * attributes are in the render object cache key, so the program key does not need the tangent. It does not
+   * assign `normalNode`, so a user normalNode and a later build without the map keep working.
    */
-  setupNormal() {
+  setupNormal(builder) {
     if (this.normalNode !== null || !this.#normalMapped())
       return super.setupNormal();
     const inputs = this.#shadingInputs();
     const sample = tslSampleST(inputs, "_BumpMap", inputs.uvMain);
+    const scale = this.propertyNode("_BumpScale", "float");
+    const hasTangent = builder?.geometry?.hasAttribute("tangent") === true;
     return this.#withNodes(
       {
         normalNode: normalMap(
           sample.rgb,
-          this.propertyNode("_BumpScale", "float")
+          vec2(scale, hasTangent ? scale : scale.negate())
         )
       },
       () => super.setupNormal()
@@ -2525,7 +2552,7 @@ function generateLilToonOutlines(root) {
       outline = surface.clone();
       outline.name = `${surface.name} (Outline)`;
       outline.isOutline = true;
-      outline.side = BackSide;
+      outline.shadowSide = BackSide;
       outlines.set(surface, outline);
     }
     object.material = [surface, outline];

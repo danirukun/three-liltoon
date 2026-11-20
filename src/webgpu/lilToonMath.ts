@@ -225,6 +225,17 @@ export const lilShade = (input: LilShadeInput): [number, number, number] => {
 	return lerpRgb(indirect, direct, first);
 };
 
+/**
+ * fd.N from the three normal on one face. `facing` is 1 on a front face and -1 on a back face; three negates the
+ * normal on a back face, lilToon does not, and `_FlipNormal` negates it (lil_pass_forward_normal.hlsl:299-303).
+ */
+export const lilFaceNormal = (
+	threeNormal: Rgb,
+	facing: number,
+	flipNormal: number,
+): [number, number, number] =>
+	mulRgb(threeNormal, facing < flipNormal - 1 ? -facing : facing);
+
 /** The lilToon blend modes of lilBlendColor: 0 Normal, 1 Add, 2 Screen, 3 Multiply. */
 export const isLilBlendMode = (mode: number): boolean =>
 	mode === 0 || mode === 1 || mode === 2 || mode === 3;

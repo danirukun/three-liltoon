@@ -1,9 +1,25 @@
-import { BackSide, DoubleSide, FrontSide, Texture } from "three";
-import { NormalMapNode, type Node } from "three/webgpu";
-import { float, vec3 } from "three/tsl";
+import {
+	BackSide,
+	BoxGeometry,
+	DoubleSide,
+	FrontSide,
+	Texture,
+	type BufferGeometry,
+} from "three";
+import { NormalMapNode, type Node, type NodeBuilder } from "three/webgpu";
+import { faceDirection, float, vec3 } from "three/tsl";
 import { describe, expect, it } from "vitest";
 import { LilToonNodeMaterial } from "../../src/webgpu/LilToonNodeMaterial";
-import { lilBlendColor, lilOutlineWidth } from "../../src/webgpu/lilToonMath";
+import {
+	lilBlendColor,
+	lilFaceNormal,
+	lilOutlineWidth,
+} from "../../src/webgpu/lilToonMath";
+import {
+	lilToonShadingInputs,
+	tslEmission,
+	tslOutlineColor,
+} from "../../src/webgpu/lilToonShading";
 import { contains, runModel, type Light } from "./fakeLighting";
 
 const light: Light = { shadowNode: null, baseColorNode: null };
@@ -192,5 +208,135 @@ describe("LilToonNodeMaterial normal map", () => {
 		const [plainBands] = runModel(plain, [light]).sourcesOf("lilBands");
 		expect(plainBands).toBeDefined();
 		expect(contains(plainBands, unused)).toBe(false);
+	});
+});
+
+describe("the face normal", () => {
+	// A DoubleSide back face: three gives the negated vertex normal.
+	const vertex = [0, 0.6, 0.8] as const;
+	const threeBack = [0, -0.6, -0.8] as const;
+
+	it("uses the vertex normal on a back face, as lilToon does", () => {
+		close(lilFaceNormal(threeBack, -1, 0), vertex);
+		close(lilFaceNormal(vertex, 1, 0), vertex);
+	});
+
+	it("negates the back-face normal with _FlipNormal 1", () => {
+		close(lilFaceNormal(threeBack, -1, 1), threeBack);
+		close(lilFaceNormal(vertex, 1, 1), vertex);
+	});
+
+	it("reads faceDirection and _FlipNormal for the bands and the effects", () => {
+		const material = new LilToonNodeMaterial({
+			properties: { _Cull: 0, _UseShadow: 1, _UseRim: 1, _UseMatCap: 1 },
+		});
+		expect(material.side).toBe(DoubleSide);
+		const flip = material.propertyNode("_FlipNormal", "float");
+		const { outgoing, sourcesOf } = runModel(material, [light]);
+		const [bands] = sourcesOf("lilBands");
+		expect(contains(bands, flip)).toBe(true);
+		expect(contains(bands, faceDirection)).toBe(true);
+		expect(contains(outgoing, flip)).toBe(true);
+	});
+});
+
+describe("the UV of the outline texture and the emission mask", () => {
+	it("samples _OutlineTex at uv0 × _OutlineTex_ST", () => {
+		const material = new LilToonNodeMaterial({
+			textures: { _OutlineTex: new Texture() },
+		});
+		const inputs = lilToonShadingInputs(material, () => true);
+		const color = tslOutlineColor(inputs);
+		expect(
+			contains(color, material.propertyNode("_OutlineTex_ST", "vec4")),
+		).toBe(true);
+		expect(contains(color, inputs.uvMain)).toBe(false);
+		expect(contains(color, material.propertyNode("_MainTex_ST", "vec4"))).toBe(
+			false,
+		);
+	});
+
+	it("samples _EmissionBlendMask at uv0 × _EmissionBlendMask_ST", () => {
+		const material = new LilToonNodeMaterial({
+			properties: { _UseEmission: 1 },
+			textures: { _EmissionBlendMask: new Texture() },
+		});
+		const inputs = lilToonShadingInputs(
+			material,
+			(name) => name === "_EmissionBlendMask",
+		);
+		const col = tslEmission(vec3(0), {
+			inputs,
+			albedo: vec3(1),
+			alpha: float(1),
+			transparent: false,
+			lightColor: vec3(1),
+			shadowmix: float(1),
+			normal: vec3(0, 0, 1),
+			geometryNormal: null,
+		});
+		expect(
+			contains(col, material.propertyNode("_EmissionBlendMask_ST", "vec4")),
+		).toBe(true);
+		expect(contains(col, inputs.uvMain)).toBe(false);
+		expect(contains(col, material.propertyNode("_MainTex_ST", "vec4"))).toBe(
+			false,
+		);
+	});
+});
+
+describe("the normal map Y", () => {
+	const material = () =>
+		new LilToonNodeMaterial({
+			properties: { _UseBumpMap: 1 },
+			textures: { _BumpMap: new Texture() },
+		});
+	const builderOf = (geometry: BufferGeometry) =>
+		({ geometry }) as unknown as NodeBuilder;
+	// The NormalMapNode scale has a negated `_BumpScale`.
+	const negatesY = (normal: Node, scale: Node) =>
+		contains(
+			normal,
+			(node) =>
+				node instanceof NormalMapNode &&
+				contains(
+					node.scaleNode,
+					(child) =>
+						(child as { method?: string }).method === "negate" &&
+						contains(child, scale),
+				),
+		);
+
+	it("negates Y without a tangent attribute, as GLTFLoader does", () => {
+		const m = material();
+		const scale = m.propertyNode("_BumpScale", "float");
+		const normal = m.setupNormal(builderOf(new BoxGeometry()));
+		expect(contains(normal, isNormalMap)).toBe(true);
+		expect(negatesY(normal, scale)).toBe(true);
+	});
+
+	it("keeps Y with a tangent attribute", () => {
+		const m = material();
+		const scale = m.propertyNode("_BumpScale", "float");
+		const geometry = new BoxGeometry();
+		geometry.computeTangents();
+		const normal = m.setupNormal(builderOf(geometry));
+		expect(contains(normal, isNormalMap)).toBe(true);
+		expect(negatesY(normal, scale)).toBe(false);
+	});
+});
+
+describe("LilToonNodeMaterial isOutline", () => {
+	it("sets the side and rebuilds when it changes", () => {
+		const material = new LilToonNodeMaterial();
+		const version = material.version;
+		material.isOutline = true;
+		expect(material.side).toBe(BackSide);
+		expect(material.version).toBe(version + 1);
+		material.isOutline = true;
+		expect(material.version).toBe(version + 1);
+		material.isOutline = false;
+		expect(material.side).toBe(FrontSide);
+		expect(material.version).toBe(version + 2);
 	});
 });

@@ -51,6 +51,9 @@ describe("generateLilToonOutlines", () => {
 		expect(outline).not.toBe(surface);
 		expect(outline.isOutline).toBe(true);
 		expect(outline.side).toBe(BackSide);
+		// The shadow pass draws the back side, as the surface does, not the front faces at the surface depth.
+		expect(outline.shadowSide).toBe(BackSide);
+		expect(surface.shadowSide).toBeNull();
 		expect(outline.name).toBe("Body (Outline)");
 		const count = geometry.index!.count;
 		expect(geometry.groups).toEqual([

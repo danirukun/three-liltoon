@@ -19,7 +19,6 @@ import {
 	max,
 	min,
 	mix,
-	negateOnBackSide,
 	normalView,
 	normalViewGeometry,
 	saturate,
@@ -37,6 +36,7 @@ import {
 	tslBacklight,
 	tslBacklightColor,
 	tslEmission,
+	tslFaceNormal,
 	tslMatCap,
 	tslNormalByStrength,
 	tslOutlineLight,
@@ -246,7 +246,12 @@ export class LilToonLightingModel extends LightingModel {
 	#blurMask: Vec4 = vec4(1);
 	#borderMask: Vec4 = vec4(1);
 	readonly #inputs: LilToonShadingInputs;
-	/** fd.origN with a normal map. three negates the normal of a back face, so origN gets the same sign. */
+	/** fd.N: the three normal without the back-face negation, then `_FlipNormal` (tslFaceNormal). */
+	readonly #normalN: Vec3;
+	/**
+	 * fd.origN with a normal map: `normalize(input.normalWS)` (lil_pass_forward_normal.hlsl:311), not negated on a back
+	 * face and not changed by `_FlipNormal`.
+	 */
 	readonly #geometryNormal: Vec3 | null;
 
 	constructor(material: LilToonNodeMaterial, host: LilToonLightingHost) {
@@ -254,9 +259,8 @@ export class LilToonLightingModel extends LightingModel {
 		this.material = material;
 		this.#host = host;
 		this.#inputs = lilToonShadingInputs(material, host.hasTexture);
-		this.#geometryNormal = host.normalMapped
-			? negateOnBackSide(normalViewGeometry)
-			: null;
+		this.#normalN = tslFaceNormal(normalView, this.#float("_FlipNormal"));
+		this.#geometryNormal = host.normalMapped ? normalViewGeometry : null;
 	}
 
 	override start(builder: NodeBuilder): void {
@@ -318,7 +322,7 @@ export class LilToonLightingModel extends LightingModel {
 		const third = this.#host.features.has("shadow3rd");
 		// lil_common_frag.hlsl:920-930 (the normal of each band) and 948-951. Without a normal map the three normals are
 		// fd.N, so one value serves all bands.
-		const plain = tslHalfLambert(normalView.dot(lightDirection));
+		const plain = tslHalfLambert(this.#normalN.dot(lightDirection));
 		const ln = (strength: string) =>
 			this.#geometryNormal
 				? tslHalfLambert(this.#normal(strength).dot(lightDirection))
@@ -415,7 +419,7 @@ export class LilToonLightingModel extends LightingModel {
 			lightColor,
 			// lil_common_frag.hlsl:1050: fd.shadowmix = lns.x before `_ShadowStrength`.
 			shadowmix: features.has("shadow") ? this.#normalizedBands().x : float(1),
-			normal: normalView,
+			normal: this.#normalN,
 			geometryNormal: this.#geometryNormal,
 		};
 		// The order of lil_pass_forward_normal.hlsl: backlight, matcap, rim light, emission.
@@ -448,7 +452,7 @@ export class LilToonLightingModel extends LightingModel {
 	/** fd.N mixed toward fd.origN by one normal strength property, fd.N without a normal map. */
 	#normal(strength: string): Vec3 {
 		return tslNormalByStrength(
-			normalView,
+			this.#normalN,
 			this.#geometryNormal,
 			this.#float(strength),
 		);

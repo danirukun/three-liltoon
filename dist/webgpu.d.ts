@@ -86,13 +86,14 @@ type TextureNode = TextureNode$1<"vec4">;
 declare class LilToonNodeMaterial extends NodeMaterial {
     #private;
     readonly isLilToonNodeMaterial = true;
-    /**
-     * The material draws the outline pass: generateLilToonOutlines sets it on the clone it makes. The build reads it,
-     * so set it before the first draw.
-     */
-    isOutline: boolean;
     constructor(parameters?: LilToonNodeMaterialParameters);
     get variant(): LilToonShaderVariant;
+    /**
+     * The material draws the outline pass: generateLilToonOutlines sets it on the clone it makes. A change sets the
+     * side (BackSide for the outline, `_Cull` for the surface) and rebuilds the program.
+     */
+    get isOutline(): boolean;
+    set isOutline(value: boolean);
     /** The requested shader has an outline pass, also when the material falls back to lilToon. */
     get hasOutline(): boolean;
     /** One overridable place for the lighting model. A subclass supplies its own. */
@@ -121,10 +122,12 @@ declare class LilToonNodeMaterial extends NodeMaterial {
     copy(source: LilToonNodeMaterial): this;
     /**
      * The normal: lilUnpackNormalScale of `_BumpMap` with `_BumpScale` (lil_common_frag.hlsl:870-881) through the
-     * three tangent frame. Without tangents, NormalMapNode uses the derivative frame. It does not assign
-     * `normalNode`, so a user normalNode and a later build without the map keep working.
+     * three tangent frame. Without a `tangent` attribute, NormalMapNode uses the derivative frame, and the textures
+     * have flipY false, so Y is negated as GLTFLoader negates `normalScale.y` (GLTFLoader.js:3642-3645). The geometry
+     * attributes are in the render object cache key, so the program key does not need the tangent. It does not
+     * assign `normalNode`, so a user normalNode and a later build without the map keep working.
      */
-    setupNormal(): Node<"vec3">;
+    setupNormal(builder?: NodeBuilder): Node<"vec3">;
     /** The outline pass moves each vertex along its normal (tslOutlinePosition). */
     setupPosition(builder: NodeBuilder): Node<"vec3">;
     /** The outline pass draws `_OutlineColor` (tslOutlineColor) instead of the main color. */
@@ -258,7 +261,12 @@ declare const tslBacklight: (input: TslBacklightInput) => Float;
 declare const tslBacklightColor: (s: LilToonSurface, backlight: Float) => Vec3;
 /** lilGetMatCap without `_MatCapCustomNormal`, lil_common_frag.hlsl:1522-1562. */
 declare const tslMatCap: (col: Vec3, s: LilToonSurface) => Vec3;
-/** lilGetRim without LIL_FEATURE_RIMLIGHT_DIRECTION, lil_common_frag.hlsl:1700-1728. */
+/**
+ * lilGetRim, lil_common_frag.hlsl:1700-1728. The shipped passes define LIL_FEATURE_RIMLIGHT_DIRECTION
+ * (ltspass_opaque.shader:671), which compiles 1647-1695. With `_RimDirStrength` 0 that branch is this one: rimDir is
+ * the rim, rimIndir is 0, and `1 - E + lightColor * E` is the `_RimEnableLighting` lerp. nodeWarnings reports a
+ * non-zero `_RimDirStrength`.
+ */
 declare const tslRim: (col: Vec3, s: LilToonSurface) => Vec3;
 /**
  * lilEmission with `_EmissionMap_UVMode` 0, without the UV animation, the gradation, and AudioLink,
@@ -273,13 +281,16 @@ declare const tslOutlinePosition: (inputs: LilToonShadingInputs, position?: Vec3
 /**
  * The outline color, OVERRIDE_OUTLINE_COLOR of lil_common_frag.hlsl:363-399 without the tone correction and with
  * `_OutlineLitColor.a` 0: `fd.col = _OutlineTex` (1 without LIL_FEATURE_OutlineTex), then `fd.col *= _OutlineColor`.
+ * The outline pass runs OVERRIDE_ANIMATE_OUTLINE_UV first (lil_pass_forward_normal.hlsl:175-176), so fd.uvMain is
+ * lilCalcUV(fd.uv0, _OutlineTex_ST, _OutlineTex_ScrollRotate) (lil_common_frag.hlsl:276-283), not the `_MainTex_ST`
+ * UV. The scroll and rotation are 0 here.
  */
 declare const tslOutlineColor: (inputs: LilToonShadingInputs) => Vec4;
 
 /**
  * Give each mesh with an outline lilToon material a second material that draws the outline, as three-vrm 3.5.5
  * MToonMaterialLoaderPlugin._generateOutline does: `mesh.material = [surface, outline]`, with one geometry group for
- * each material. The outline is a clone of the surface with `isOutline` true and the back side. The material keys on
+ * each material. The outline is a clone of the surface with `isOutline` true, which also sets the back side. The material keys on
  * the outline flag of the shader variant, not on `_OutlineWidth`. A mesh whose material is already an array is left
  * unchanged, so a second call does nothing. three-vrm draws a third of the index count; this draws all of it, so the
  * count is correct for a geometry without an index too.

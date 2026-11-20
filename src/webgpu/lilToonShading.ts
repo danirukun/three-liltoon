@@ -120,6 +120,21 @@ export const tslBlendColor = (
 export const tslBackfaceMask = (value: Float, mask: Float): Float =>
 	select(faceDirection.lessThan(mask.sub(1)), float(0), value);
 
+/**
+ * fd.N from the three normal. r187 negates `normalView` on a back face (Normal.js:105; with a normal map the whole
+ * TBN frame, Tangent.js and Bitangent.js), so `faceDirection` undoes it. lilToon keeps the vertex normal on a back
+ * face and negates it only with `_FlipNormal`: `fd.N = fd.facing < (_FlipNormal-1.0) ? -fd.N : fd.N`
+ * (lil_pass_forward_normal.hlsl:299-303). lilFaceNormal of lilToonMath.ts is the same on numbers.
+ */
+export const tslFaceNormal = (normal: Vec3, flipNormal: Float): Vec3 => {
+	const unflipped = normal.mul(faceDirection);
+	return select(
+		faceDirection.lessThan(flipNormal.sub(1)),
+		unflipped.negate(),
+		unflipped,
+	);
+};
+
 /** `lerp(fd.origN, fd.N, strength)` with LIL_FEATURE_NORMAL_1ST, fd.N without it. lilToon does not normalize it. */
 export const tslNormalByStrength = (
 	normal: Vec3,
@@ -287,6 +302,7 @@ export const tslMatCap = (col: Vec3, s: LilToonSurface): Vec3 => {
 		: masked;
 	// 1554-1558
 	const facing = tslBackfaceMask(alpha, p("_MatCapBackfaceMask"));
+	// 1556-1557: LIL_SAMPLE_2D_ST at fd.uvMain. The matcap mask has no UV animation feature in the shipped passes.
 	const mask = tslSampleST(inputs, "_MatCapBlendMask", inputs.uvMain).rgb;
 	// 1561-1562
 	const rgb = mix(lit, lit.mul(s.albedo), p("_MatCapMainStrength"));
@@ -298,7 +314,12 @@ export const tslMatCap = (col: Vec3, s: LilToonSurface): Vec3 => {
 	);
 };
 
-/** lilGetRim without LIL_FEATURE_RIMLIGHT_DIRECTION, lil_common_frag.hlsl:1700-1728. */
+/**
+ * lilGetRim, lil_common_frag.hlsl:1700-1728. The shipped passes define LIL_FEATURE_RIMLIGHT_DIRECTION
+ * (ltspass_opaque.shader:671), which compiles 1647-1695. With `_RimDirStrength` 0 that branch is this one: rimDir is
+ * the rim, rimIndir is 0, and `1 - E + lightColor * E` is the `_RimEnableLighting` lerp. nodeWarnings reports a
+ * non-zero `_RimDirStrength`.
+ */
 export const tslRim = (col: Vec3, s: LilToonSurface): Vec3 => {
 	const { inputs } = s;
 	const p = inputs.float;
@@ -348,11 +369,14 @@ export const tslBlink = (blink: Vec4): Float => {
 export const tslEmission = (col: Vec3, s: LilToonSurface): Vec3 => {
 	const { inputs } = s;
 	const p = inputs.float;
-	// 1821-1843: the map at fd.uv0 and the mask at fd.uvMain. The parallax offset is 0 without LIL_FEATURE_PARALLAX.
+	// 1821-1843. The shipped passes define LIL_FEATURE_ANIMATE_EMISSION_UV and LIL_FEATURE_ANIMATE_EMISSION_MASK_UV
+	// (ltspass_opaque.shader:661-662), so the map is LIL_GET_EMITEX at fd.uv0 (1831) and the mask is LIL_GET_EMIMASK at
+	// fd.uv0 (1839): lilCalcUV(fd.uv0, <texture>_ST, <texture>_ScrollRotate) (lil_common_macro.hlsl:2342-2343), without
+	// `_MainTex_ST`. The scroll and rotation are 0 here. The parallax offset is 0 without LIL_FEATURE_PARALLAX.
 	const color = inputs
 		.vec4("_EmissionColor")
 		.mul(tslSampleST(inputs, "_EmissionMap", uv()))
-		.mul(tslSampleST(inputs, "_EmissionBlendMask", inputs.uvMain));
+		.mul(tslSampleST(inputs, "_EmissionBlendMask", uv()));
 	// 1859: fd.invLighting = saturate((1.0 - fd.lightColor) * sqrt(fd.lightColor)) (lil_common_macro.hlsl:2311)
 	const invLighting = saturate(s.lightColor.oneMinus().mul(sqrt(s.lightColor)));
 	const fluorescent = mix(
@@ -407,11 +431,15 @@ export const tslOutlinePosition = (
 /**
  * The outline color, OVERRIDE_OUTLINE_COLOR of lil_common_frag.hlsl:363-399 without the tone correction and with
  * `_OutlineLitColor.a` 0: `fd.col = _OutlineTex` (1 without LIL_FEATURE_OutlineTex), then `fd.col *= _OutlineColor`.
+ * The outline pass runs OVERRIDE_ANIMATE_OUTLINE_UV first (lil_pass_forward_normal.hlsl:175-176), so fd.uvMain is
+ * lilCalcUV(fd.uv0, _OutlineTex_ST, _OutlineTex_ScrollRotate) (lil_common_frag.hlsl:276-283), not the `_MainTex_ST`
+ * UV. The scroll and rotation are 0 here.
  */
 export const tslOutlineColor = (inputs: LilToonShadingInputs): Vec4 => {
-	const texture = inputs.texture("_OutlineTex");
 	const color = inputs.vec4("_OutlineColor");
-	return texture ? texture.sample(inputs.uvMain).mul(color) : color;
+	return inputs.texture("_OutlineTex")
+		? tslSampleST(inputs, "_OutlineTex", uv()).mul(color)
+		: color;
 };
 
 /**

@@ -110,6 +110,7 @@ const NODE_EXTRA_DEFAULTS: Readonly<Record<string, readonly number[]>> = {
 	_BacklightColorTex_ST: IDENTITY_ST,
 	_EmissionMap_ST: IDENTITY_ST,
 	_EmissionBlendMask_ST: IDENTITY_ST,
+	_OutlineTex_ST: IDENTITY_ST,
 };
 
 export function nodeVariant(name: string | undefined): LilToonNodeVariant {
