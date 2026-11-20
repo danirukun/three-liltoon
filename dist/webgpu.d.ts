@@ -1,4 +1,4 @@
-import { Color, Vector2, Vector3, Vector4, Texture } from 'three';
+import { Color, Vector2, Vector3, Vector4, Texture, Object3D } from 'three';
 import { NodeMaterial, LightingModel, NodeBuilder, Node, UniformNode, TextureNode as TextureNode$1, LightingModelDirectInput } from 'three/webgpu';
 
 /** Supported Unity shader names and their pass configurations. */
@@ -86,9 +86,15 @@ type TextureNode = TextureNode$1<"vec4">;
 declare class LilToonNodeMaterial extends NodeMaterial {
     #private;
     readonly isLilToonNodeMaterial = true;
+    /**
+     * The material draws the outline pass: generateLilToonOutlines sets it on the clone it makes. The build reads it,
+     * so set it before the first draw.
+     */
     isOutline: boolean;
     constructor(parameters?: LilToonNodeMaterialParameters);
     get variant(): LilToonShaderVariant;
+    /** The requested shader has an outline pass, also when the material falls back to lilToon. */
+    get hasOutline(): boolean;
     /** One overridable place for the lighting model. A subclass supplies its own. */
     setupLightingModel(): LightingModel;
     setupLighting(builder: NodeBuilder): Node;
@@ -114,6 +120,16 @@ declare class LilToonNodeMaterial extends NodeMaterial {
     customProgramCacheKey(): string;
     copy(source: LilToonNodeMaterial): this;
     /**
+     * The normal: lilUnpackNormalScale of `_BumpMap` with `_BumpScale` (lil_common_frag.hlsl:870-881) through the
+     * three tangent frame. Without tangents, NormalMapNode uses the derivative frame. It does not assign
+     * `normalNode`, so a user normalNode and a later build without the map keep working.
+     */
+    setupNormal(): Node<"vec3">;
+    /** The outline pass moves each vertex along its normal (tslOutlinePosition). */
+    setupPosition(builder: NodeBuilder): Node<"vec3">;
+    /** The outline pass draws `_OutlineColor` (tslOutlineColor) instead of the main color. */
+    setupDiffuseColor(builder: NodeBuilder): void;
+    /**
      * Build the nodes that read this material. The constructor and `copy` call it,
      * because NodeMaterial.copy aliases the source nodes. A subclass overrides it,
      * calls `super.setupNodes()`, and assigns its own nodes. It runs before the
@@ -122,8 +138,8 @@ declare class LilToonNodeMaterial extends NodeMaterial {
     protected setupNodes(): void;
 }
 
-type Float = Node<"float">;
-type Vec3 = Node<"vec3">;
+type Float$1 = Node<"float">;
+type Vec3$1 = Node<"vec3">;
 /**
  * What the lighting model reads from its material while it builds. `setupLightingModel()` makes a new one for each
  * build, so a later build of the same material does not change the state of a build that is still running.
@@ -133,8 +149,14 @@ interface LilToonLightingHost {
     shadowed: ReadonlySet<object>;
     features: ReadonlySet<keyof LilToonFeatureSet>;
     hasTexture(name: string): boolean;
-    receivedShadow(shadow: Float): Float;
-    roomIrradiance(irradiance: Vec3, iblIrradiance: Vec3): Vec3 | null;
+    receivedShadow(shadow: Float$1): Float$1;
+    roomIrradiance(irradiance: Vec3$1, iblIrradiance: Vec3$1): Vec3$1 | null;
+    /** The material is the outline of generateLilToonOutlines. It draws the outline color only. */
+    outline: boolean;
+    /** LIL_RENDER == 2. */
+    transparent: boolean;
+    /** LIL_FEATURE_NORMAL_1ST with a `_BumpMap`: the material maps the normal, so the normal strengths apply. */
+    normalMapped: boolean;
 }
 /**
  * The lilToon lighting of LilToonNodeMaterial.
@@ -143,6 +165,8 @@ interface LilToonLightingHost {
  * each three light with its own bands and sums them: `direct()` adds the light color × UNITY_LIGHT_SCALE to a summed
  * light, and its bands × lilGray(light color) to a band sum. `finish()` divides the band sum by the summed weight
  * and shades the summed light once, as lilGetShading shades the main light. With one light this is the Unity result.
+ * The backlight factor of each light has the same weight. Rim light, matcap, and emission do not depend on the light
+ * direction; `finish()` applies them once to the shaded color, with the summed light, as lilToon does.
  */
 declare class LilToonLightingModel extends LightingModel {
     #private;
@@ -167,9 +191,103 @@ declare const lilBand: (nl: number, border: number, blur: number, borderRange?: 
  * monochrome mix.
  */
 declare const lilLimitLight: (color: Rgb, min: number, max: number, monochrome: number) => [number, number, number];
+/**
+ * lilBlendColor, lil_common_functions.hlsl:325-340. The HLSL leaves `outCol` unset for a mode outside 0-3. This
+ * port draws such a mode as 0, and nodeWarnings reports it.
+ */
+declare const lilBlendColor: (dst: Rgb, src: Rgb, srcA: number | Rgb, mode: number) => [number, number, number];
+/**
+ * lilGetOutlineWidth with `_OutlineVertexR2Width` 0, lil_common_functions.hlsl:273-290: `_OutlineWidth` is in
+ * centimetres, times the `_OutlineWidthMask` red channel. `_OutlineFixWidth` narrows it within 1 m of the camera.
+ */
+declare const lilOutlineWidth: (width: number, mask: number, fixWidth: number, cameraDistance: number) => number;
+
+type Float = Node<"float">;
+type Vec2 = Node<"vec2">;
+type Vec3 = Node<"vec3">;
+type Vec4 = Node<"vec4">;
+/** What the shading functions read from the material. */
+interface LilToonShadingInputs {
+    float(name: string): Float;
+    vec4(name: string): Vec4;
+    /** The texture of one slot, or null when the slot has no texture. */
+    texture(name: string): TextureNode$1<"vec4"> | null;
+    /** fd.uvMain: uv0 × `_MainTex_ST`. */
+    uvMain: Vec2;
+}
+/** The part of LilToonNodeMaterial that the shading inputs read. */
+interface LilToonShadingSource {
+    propertyNode(name: string, type: "float"): Float;
+    propertyNode(name: string, type: "vec4"): Vec4;
+    textureNode(name: string): TextureNode$1<"vec4">;
+}
+/** The shading inputs of a material. `hasTexture` is the texture state of one build. */
+declare const lilToonShadingInputs: (source: LilToonShadingSource, hasTexture: (name: string) => boolean) => LilToonShadingInputs;
+/** The state of lilFragData after the lighting, which the effects read. */
+interface LilToonSurface {
+    inputs: LilToonShadingInputs;
+    /** fd.albedo. */
+    albedo: Vec3;
+    /** fd.col.a. */
+    alpha: Float;
+    /** LIL_RENDER == 2. */
+    transparent: boolean;
+    /** fd.lightColor after the light limit. */
+    lightColor: Vec3;
+    /** fd.shadowmix: the first shadow band before `_ShadowStrength`, 1 without `_UseShadow`. */
+    shadowmix: Float;
+    /** fd.N. */
+    normal: Vec3;
+    /** fd.origN with LIL_FEATURE_NORMAL_1ST. `null` without it, so the normal strengths do not apply. */
+    geometryNormal: Vec3 | null;
+}
+/** lilBlendColor, lil_common_functions.hlsl:325-340. A mode outside 0-3 is 0, as lilBlendColor of lilToonMath.ts. */
+declare const tslBlendColor: (dst: Vec3, src: Vec3, srcA: Float | Vec3, mode: Float) => Vec3;
+interface TslBacklightInput {
+    inputs: LilToonShadingInputs;
+    /** fd.N after `_BacklightNormalStrength` (lil_common_frag.hlsl:1238-1241). */
+    normal: Vec3;
+    /** fd.L of this light. */
+    lightDirection: Vec3;
+    /** The cast shadow of this light after receivedShadow, 1 lit. */
+    shadow: Float;
+}
+/** The backlight of one light, lilBacklight of lil_common_frag.hlsl:1250-1257. */
+declare const tslBacklight: (input: TslBacklightInput) => Float;
+/** The backlight color for the factor of tslBacklight, lil_common_frag.hlsl:1244-1247 and 1260-1261. */
+declare const tslBacklightColor: (s: LilToonSurface, backlight: Float) => Vec3;
+/** lilGetMatCap without `_MatCapCustomNormal`, lil_common_frag.hlsl:1522-1562. */
+declare const tslMatCap: (col: Vec3, s: LilToonSurface) => Vec3;
+/** lilGetRim without LIL_FEATURE_RIMLIGHT_DIRECTION, lil_common_frag.hlsl:1700-1728. */
+declare const tslRim: (col: Vec3, s: LilToonSurface) => Vec3;
+/**
+ * lilEmission with `_EmissionMap_UVMode` 0, without the UV animation, the gradation, and AudioLink,
+ * lil_common_frag.hlsl:1819-1865.
+ */
+declare const tslEmission: (col: Vec3, s: LilToonSurface) => Vec3;
+/**
+ * The outline position, lilCalcOutlinePosition with `_OutlineVertexR2Width` 0, without `_OutlineVectorTex`, and with
+ * `_OutlineZBias` 0, lil_common_functions.hlsl:298-307 and 273-288. It runs in the vertex stage.
+ */
+declare const tslOutlinePosition: (inputs: LilToonShadingInputs, position?: Vec3) => Vec3;
+/**
+ * The outline color, OVERRIDE_OUTLINE_COLOR of lil_common_frag.hlsl:363-399 without the tone correction and with
+ * `_OutlineLitColor.a` 0: `fd.col = _OutlineTex` (1 without LIL_FEATURE_OutlineTex), then `fd.col *= _OutlineColor`.
+ */
+declare const tslOutlineColor: (inputs: LilToonShadingInputs) => Vec4;
+
+/**
+ * Give each mesh with an outline lilToon material a second material that draws the outline, as three-vrm 3.5.5
+ * MToonMaterialLoaderPlugin._generateOutline does: `mesh.material = [surface, outline]`, with one geometry group for
+ * each material. The outline is a clone of the surface with `isOutline` true and the back side. The material keys on
+ * the outline flag of the shader variant, not on `_OutlineWidth`. A mesh whose material is already an array is left
+ * unchanged, so a second call does nothing. three-vrm draws a third of the index count; this draws all of it, so the
+ * count is correct for a geometry without an index too.
+ */
+declare function generateLilToonOutlines(root: Object3D): void;
 
 declare class GLTFLilToonNodeExtension {
 }
 declare const enableLilToonNodeVRM: () => void;
 
-export { GLTFLilToonNodeExtension, LILTOON_NODE_FEATURES, LILTOON_NODE_VARIANTS, type LilToonLightingHost, LilToonLightingModel, LilToonNodeMaterial, type LilToonNodeMaterialParameters, type LilToonNodeMode, type LilToonNodeValue, type LilToonNodeVariant, type LilToonScalarOrVector, UNITY_LIGHT_SCALE, enableLilToonNodeVRM, lilBand, lilLimitLight, nodeProperties, nodeVariant, nodeWarnings };
+export { GLTFLilToonNodeExtension, LILTOON_NODE_FEATURES, LILTOON_NODE_VARIANTS, type LilToonLightingHost, LilToonLightingModel, LilToonNodeMaterial, type LilToonNodeMaterialParameters, type LilToonNodeMode, type LilToonNodeValue, type LilToonNodeVariant, type LilToonScalarOrVector, type LilToonShadingInputs, type LilToonSurface, UNITY_LIGHT_SCALE, enableLilToonNodeVRM, generateLilToonOutlines, lilBand, lilBlendColor, lilLimitLight, lilOutlineWidth, lilToonShadingInputs, nodeProperties, nodeVariant, nodeWarnings, tslBacklight, tslBacklightColor, tslBlendColor, tslEmission, tslMatCap, tslOutlineColor, tslOutlinePosition, tslRim };

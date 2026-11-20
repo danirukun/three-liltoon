@@ -13,6 +13,7 @@ import {
 } from "../material/shaderVariants.js";
 import type { LilToonWarning } from "../utils/materialWarnings.js";
 import type { Color, Texture, Vector2, Vector3, Vector4 } from "three";
+import { isLilBlendMode } from "./lilToonMath.js";
 
 // Same shape as the WebGL material type. That module name is banned in src/webgpu.
 export type LilToonScalarOrVector =
@@ -71,12 +72,44 @@ const FEATURE_PROPERTY: Record<keyof LilToonFeatureSet, string> = {
 	dissolve: "_DissolveParams",
 };
 
-/** Shadow types whose non-zero values the node path does not draw (lil_common_frag.hlsl:953-971, 1053-1061, 1072-1087). */
-const UNSUPPORTED_SHADOW_TYPES = ["_ShadowMaskType", "_ShadowColorType"];
+/**
+ * Properties whose non-zero values the node path does not draw, by the feature that reads them: the shadow types
+ * (lil_common_frag.hlsl:953-971, 1053-1061, 1072-1087), the rim direction (LIL_FEATURE_RIMLIGHT_DIRECTION,
+ * 1647-1695), the matcap normal map (1527-1535), and the emission UV mode and gradation (1823-1857).
+ */
+const UNSUPPORTED_VALUES: readonly (readonly [
+	keyof LilToonFeatureSet,
+	string,
+])[] = [
+	["shadow", "_ShadowMaskType"],
+	["shadow", "_ShadowColorType"],
+	["rim", "_RimDirStrength"],
+	["matcap", "_MatCapCustomNormal"],
+	["emission1st", "_EmissionMap_UVMode"],
+	["emission1st", "_EmissionUseGrad"],
+];
 
-/** Properties the node path reads that the generated defaults do not list. */
+const OUTLINE_UNSUPPORTED_VALUES = ["_OutlineVertexR2Width", "_OutlineZBias"];
+
+/** The lilBlendColor mode of each feature (lil_common_functions.hlsl:325-335). */
+const BLEND_MODES: readonly (readonly [keyof LilToonFeatureSet, string])[] = [
+	["matcap", "_MatCapBlendMode"],
+	["rim", "_RimBlendMode"],
+	["emission1st", "_EmissionBlendMode"],
+];
+
+const IDENTITY_ST = [1, 1, 0, 0] as const;
+
+/** Properties the node path reads that the generated defaults do not list: the `<texture>_ST` of LIL_SAMPLE_2D_ST. */
 const NODE_EXTRA_DEFAULTS: Readonly<Record<string, readonly number[]>> = {
-	_MainTex_ST: [1, 1, 0, 0],
+	_MainTex_ST: IDENTITY_ST,
+	_BumpMap_ST: IDENTITY_ST,
+	_MatCapTex_ST: IDENTITY_ST,
+	_MatCapBlendMask_ST: IDENTITY_ST,
+	_RimColorTex_ST: IDENTITY_ST,
+	_BacklightColorTex_ST: IDENTITY_ST,
+	_EmissionMap_ST: IDENTITY_ST,
+	_EmissionBlendMask_ST: IDENTITY_ST,
 };
 
 export function nodeVariant(name: string | undefined): LilToonNodeVariant {
@@ -195,21 +228,44 @@ export function nodeWarnings(
 			message: `${property} is enabled, but the WebGPU material does not implement it. The model will load without this feature.`,
 		});
 	}
-	// Shadow variants the node path draws as type 0: the flat and face (SDF) mask types, and the LUT shadow color.
-	const shadowOn = enabledNodeFeatures(selection.variant, merged).includes(
-		"shadow",
-	);
-	for (const property of UNSUPPORTED_SHADOW_TYPES) {
-		const value = merged[property];
-		if (!shadowOn || typeof value !== "number" || value === 0) continue;
+	const enabled = new Set(enabledNodeFeatures(selection.variant, merged));
+	const warn = (property: string, message: string) =>
 		warnings.push({
 			severity: "warning",
 			code: "unsupported-feature",
 			materialName: name,
 			shaderKey,
 			property,
-			message: `${property} ${value} is not implemented for WebGPU. The material draws it as ${property} 0.`,
+			message,
 		});
+	// Values the node path draws as 0, such as the flat and face (SDF) shadow mask types.
+	for (const [feature, property] of UNSUPPORTED_VALUES) {
+		const value = merged[property];
+		if (!enabled.has(feature) || typeof value !== "number" || value === 0)
+			continue;
+		warn(
+			property,
+			`${property} ${value} is not implemented for WebGPU. The material draws it as ${property} 0.`,
+		);
+	}
+	// lilCalcOutlinePosition, lil_common_functions.hlsl:298-310: the vertex color width and the view bias.
+	for (const property of OUTLINE_UNSUPPORTED_VALUES) {
+		const value = merged[property];
+		if (!selection.outline || typeof value !== "number" || value === 0)
+			continue;
+		warn(
+			property,
+			`${property} ${value} is not implemented for WebGPU. The outline draws it as ${property} 0.`,
+		);
+	}
+	for (const [feature, property] of BLEND_MODES) {
+		const value = merged[property];
+		if (!enabled.has(feature) || typeof value !== "number") continue;
+		if (isLilBlendMode(value)) continue;
+		warn(
+			property,
+			`${property} ${value} is not a lilToon blend mode (0-3). The material uses 0.`,
+		);
 	}
 	return warnings;
 }

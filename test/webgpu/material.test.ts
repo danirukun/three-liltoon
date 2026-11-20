@@ -11,6 +11,7 @@ describe("LilToonNodeMaterial alpha modes", () => {
 		expect(material.variant).toBe("lilToon");
 		expect(material.transparent).toBe(false);
 		expect(material.alphaTest).toBe(0);
+		expect(material.hasOutline).toBe(false);
 		expect(material.isOutline).toBe(false);
 	});
 
@@ -38,7 +39,9 @@ describe("LilToonNodeMaterial alpha modes", () => {
 		const material = new LilToonNodeMaterial({
 			shaderVariant: "Hidden/lilToonCutoutOutline",
 		});
-		expect(material.isOutline).toBe(true);
+		expect(material.hasOutline).toBe(true);
+		// The surface pass. generateLilToonOutlines makes the outline pass.
+		expect(material.isOutline).toBe(false);
 		expect(material.variant).toBe("Hidden/lilToonCutoutOutline");
 	});
 
@@ -167,7 +170,7 @@ describe("LilToonNodeMaterial clone", () => {
 		const clone = source.clone();
 		expect(clone).toBeInstanceOf(LilToonNodeMaterial);
 		expect(clone.variant).toBe("Hidden/lilToonCutoutOutline");
-		expect(clone.isOutline).toBe(true);
+		expect(clone.hasOutline).toBe(true);
 		expect(clone.alphaTest).toBe(0.4);
 		expect(clone.getTexture("_MainTex")).toBe(source.getTexture("_MainTex"));
 

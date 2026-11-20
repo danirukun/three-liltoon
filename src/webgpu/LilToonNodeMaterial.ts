@@ -1,5 +1,12 @@
-import { Vector2, Vector3, Vector4 } from "three";
-import type { Texture } from "three";
+import {
+	BackSide,
+	DoubleSide,
+	FrontSide,
+	Vector2,
+	Vector3,
+	Vector4,
+} from "three";
+import type { Side, Texture } from "three";
 import { NodeMaterial } from "three/webgpu";
 import type {
 	LightingModel,
@@ -8,7 +15,16 @@ import type {
 	TextureNode as TextureNodeType,
 	UniformNode,
 } from "three/webgpu";
-import { context, float, texture, uniform, uv, vec4 } from "three/tsl";
+import {
+	context,
+	float,
+	normalMap,
+	positionLocal,
+	texture,
+	uniform,
+	uv,
+	vec4,
+} from "three/tsl";
 import { LILTOON_DEFAULTS } from "../generated/defaults.js";
 import type { LilToonFeatureSet } from "../material/LilToonFeatureSet.js";
 import type { LilToonShaderVariant } from "../material/shaderVariants.js";
@@ -21,6 +37,13 @@ import {
 	LilToonLightingModel,
 	type LilToonLightingHost,
 } from "./LilToonLightingModel.js";
+import {
+	lilToonShadingInputs,
+	tslOutlineColor,
+	tslOutlinePosition,
+	tslSampleST,
+	type LilToonShadingInputs,
+} from "./lilToonShading.js";
 import {
 	LILTOON_NODE_FEATURES,
 	enabledNodeFeatures,
@@ -76,11 +99,23 @@ const neutralFor = (name: string): Texture => {
 const copyValue = (value: LilToonNodeValue): LilToonNodeValue =>
 	Array.isArray(value) ? [...value] : value;
 
+/** `_Cull` is the Unity CullMode: 0 Off, 1 Front, 2 Back. three draws the side that the cull keeps. */
+const CULL_SIDE: Record<number, Side> = {
+	0: DoubleSide,
+	1: BackSide,
+	2: FrontSide,
+};
+
 export class LilToonNodeMaterial extends NodeMaterial {
 	readonly isLilToonNodeMaterial = true;
+	/**
+	 * The material draws the outline pass: generateLilToonOutlines sets it on the clone it makes. The build reads it,
+	 * so set it before the first draw.
+	 */
 	isOutline = false;
 
 	#variant: LilToonShaderVariant = "lilToon";
+	#outline = false;
 	#mode: LilToonNodeMode = "opaque";
 	#requestedShader: string | undefined;
 	#properties: Record<string, LilToonNodeValue> = {};
@@ -101,11 +136,17 @@ export class LilToonNodeMaterial extends NodeMaterial {
 		for (const [name, value] of Object.entries(parameters.textures ?? {}))
 			this.#assignTexture(name, value);
 		this.#applyAlphaMode();
+		this.#applyCull();
 		this.setupNodes();
 	}
 
 	get variant(): LilToonShaderVariant {
 		return this.#variant;
+	}
+
+	/** The requested shader has an outline pass, also when the material falls back to lilToon. */
+	get hasOutline(): boolean {
+		return this.#outline;
 	}
 
 	/** One overridable place for the lighting model. A subclass supplies its own. */
@@ -151,6 +192,7 @@ export class LilToonNodeMaterial extends NodeMaterial {
 		this.#properties[name] = next;
 		this.#syncNode(name, next);
 		if (name === "_Cutoff") this.#applyAlphaMode();
+		if (name === "_Cull") this.#applyCull();
 		if (this.#programKey() !== before) this.needsUpdate = true;
 	}
 
@@ -214,6 +256,7 @@ export class LilToonNodeMaterial extends NodeMaterial {
 		this.#requestedShader = source.#requestedShader;
 		this.#variant = source.#variant;
 		this.#mode = source.#mode;
+		this.#outline = source.#outline;
 		this.isOutline = source.isOutline;
 		this.#properties = Object.fromEntries(
 			Object.entries(source.#properties).map(([name, value]) => [
@@ -235,7 +278,7 @@ export class LilToonNodeMaterial extends NodeMaterial {
 		this.#requestedShader = shader;
 		this.#variant = selection.variant;
 		this.#mode = selection.mode;
-		this.isOutline = selection.outline;
+		this.#outline = selection.outline;
 	}
 
 	#assignTexture(name: string, value: Texture | null): void {
@@ -258,14 +301,96 @@ export class LilToonNodeMaterial extends NodeMaterial {
 	 */
 	#lightingHost(): LilToonLightingHost {
 		const textures = { ...this.#textures };
+		const outline = this.isOutline;
 		return {
 			shadowed: this.#shadowed,
-			features: new Set(this.#features()),
+			// The outline pass draws the outline color only (lil_pass_forward_normal.hlsl, LIL_OUTLINE).
+			features: new Set(outline ? [] : this.#features()),
 			hasTexture: (name) => textures[name] != null,
 			receivedShadow: (shadow) => this.receivedShadow(shadow),
 			roomIrradiance: (irradiance, iblIrradiance) =>
 				this.roomIrradiance(irradiance, iblIrradiance),
+			outline,
+			transparent: this.#mode === "transparent",
+			normalMapped: this.#normalMapped(),
 		};
+	}
+
+	/** LIL_FEATURE_NORMAL_1ST with a `_BumpMap`. The outline pass does not map the normal. */
+	#normalMapped(): boolean {
+		return (
+			!this.isOutline &&
+			this.#features().includes("normal1st") &&
+			this.#textures._BumpMap != null
+		);
+	}
+
+	#shadingInputs(): LilToonShadingInputs {
+		const textures = { ...this.#textures };
+		return lilToonShadingInputs(this, (name) => textures[name] != null);
+	}
+
+	/**
+	 * The normal: lilUnpackNormalScale of `_BumpMap` with `_BumpScale` (lil_common_frag.hlsl:870-881) through the
+	 * three tangent frame. Without tangents, NormalMapNode uses the derivative frame. It does not assign
+	 * `normalNode`, so a user normalNode and a later build without the map keep working.
+	 */
+	override setupNormal(): Node<"vec3"> {
+		if (this.normalNode !== null || !this.#normalMapped())
+			return super.setupNormal() as Node<"vec3">;
+		const inputs = this.#shadingInputs();
+		const sample = tslSampleST(inputs, "_BumpMap", inputs.uvMain);
+		return this.#withNodes(
+			{
+				normalNode: normalMap(
+					sample.rgb,
+					this.propertyNode("_BumpScale", "float"),
+				),
+			},
+			() => super.setupNormal() as Node<"vec3">,
+		);
+	}
+
+	/** The outline pass moves each vertex along its normal (tslOutlinePosition). */
+	override setupPosition(builder: NodeBuilder): Node<"vec3"> {
+		if (!this.isOutline) return super.setupPosition(builder) as Node<"vec3">;
+		const position = tslOutlinePosition(
+			this.#shadingInputs(),
+			(this.positionNode as Node<"vec3"> | null) ?? positionLocal,
+		);
+		return this.#withNodes(
+			{ positionNode: position },
+			() => super.setupPosition(builder) as Node<"vec3">,
+		);
+	}
+
+	/** The outline pass draws `_OutlineColor` (tslOutlineColor) instead of the main color. */
+	override setupDiffuseColor(builder: NodeBuilder): void {
+		if (!this.isOutline) return super.setupDiffuseColor(builder);
+		const color = tslOutlineColor(this.#shadingInputs());
+		this.#withNodes(
+			{ colorNode: vec4(color.rgb, 1), opacityNode: color.a },
+			() => super.setupDiffuseColor(builder),
+		);
+	}
+
+	/** Run `build` with some material nodes replaced, then restore them, so the build does not change the material. */
+	#withNodes<T>(
+		nodes: Partial<
+			Pick<this, "colorNode" | "opacityNode" | "positionNode" | "normalNode">
+		>,
+		build: () => T,
+	): T {
+		const keys = Object.keys(nodes) as (keyof typeof nodes)[];
+		const saved = keys.map((key) => this[key]);
+		Object.assign(this, nodes);
+		try {
+			return build();
+		} finally {
+			keys.forEach((key, i) => {
+				(this as Record<string, unknown>)[key] = saved[i];
+			});
+		}
 	}
 
 	#features(): (keyof LilToonFeatureSet)[] {
@@ -279,7 +404,8 @@ export class LilToonNodeMaterial extends NodeMaterial {
 		const present = Object.keys(this.#textures)
 			.filter((name) => this.#textures[name] !== null)
 			.sort();
-		return `${this.#variant}|${features.join(",")}|${present.join(",")}`;
+		const pass = this.isOutline ? "|outline" : "";
+		return `${this.#variant}|${features.join(",")}|${present.join(",")}${pass}`;
 	}
 
 	#applyAlphaMode(): void {
@@ -288,6 +414,14 @@ export class LilToonNodeMaterial extends NodeMaterial {
 			this.#mode === "cutout" && typeof cutoff === "number" ? cutoff : 0;
 		this.transparent = this.#mode === "transparent";
 		if (this.#mode === "transparent") this.depthWrite = false;
+	}
+
+	/** `_Cull` to the side. The outline pass draws the back side only (lil_pass_forward_normal.hlsl, Cull Front). */
+	#applyCull(): void {
+		const cull = this.#properties._Cull;
+		this.side = this.isOutline
+			? BackSide
+			: (CULL_SIDE[typeof cull === "number" ? cull : 2] ?? FrontSide);
 	}
 
 	/**

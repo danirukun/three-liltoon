@@ -1,6 +1,6 @@
-import { Vector2, Vector3, Vector4, SRGBColorSpace, LinearSRGBColorSpace, RepeatWrapping, DataTexture, RGBAFormat, UnsignedByteType, LinearFilter } from 'three';
+import { BackSide, FrontSide, DoubleSide, Vector2, Vector3, Vector4, SRGBColorSpace, LinearSRGBColorSpace, RepeatWrapping, DataTexture, RGBAFormat, UnsignedByteType, LinearFilter } from 'three';
 import { LightingModel, NodeMaterial } from 'three/webgpu';
-import { vec3, float, vec4, normalView, select, frontFacing, diffuseColor, mix, max, vec2, abs, dFdx, dFdy, uv, context, texture, saturate as saturate$1, dot, clamp, min, uniform, fwidth } from 'three/tsl';
+import { positionLocal, uv, select, max, mix, pow, saturate as saturate$1, dot, positionViewDirection, normalize, float, abs, sqrt, modelWorldMatrix, vec4, length, cameraPosition, normalLocal, vec3, negateOnBackSide, normalViewGeometry, normalView, frontFacing, diffuseColor, vec2, dFdx, dFdy, context, texture, normalMap, fwidth, faceDirection, cameraProjectionMatrix, cameraViewMatrix, cross, sin, time, round, min, uniform, clamp } from 'three/tsl';
 
 // src/webgpu/LilToonNodeMaterial.ts
 
@@ -1430,6 +1430,7 @@ var lerp = (a, b, t) => a + (b - a) * t;
 var lerpRgb = (a, b, t) => [0, 1, 2].map(
   (i) => lerp(a[i], b[i], typeof t === "number" ? t : t[i])
 );
+var mulRgb = (a, b) => [0, 1, 2].map((i) => a[i] * (typeof b === "number" ? b : b[i]));
 var lilBandNoSaturate = (nl, border, blur, borderRange = 0, aa = 0) => {
   const borderMin = saturate(border - blur * 0.5 - borderRange);
   const borderMax = saturate(border + blur * 0.5);
@@ -1437,11 +1438,216 @@ var lilBandNoSaturate = (nl, border, blur, borderRange = 0, aa = 0) => {
 };
 var lilBand = (nl, border, blur, borderRange = 0, aa = 0) => saturate(lilBandNoSaturate(nl, border, blur, borderRange, aa));
 var lilGray = (color) => (color[0] + color[1] + color[2]) / 3;
-var lilLimitLight = (color, min2, max2, monochrome) => {
-  const clamped = color.map((c) => Math.min(Math.max(c, min2), max2));
+var lilLimitLight = (color, min2, max3, monochrome) => {
+  const clamped = color.map((c) => Math.min(Math.max(c, min2), max3));
   const gray = lilGray(clamped);
   return lerpRgb(clamped, [gray, gray, gray], monochrome);
 };
+var isLilBlendMode = (mode) => mode === 0 || mode === 1 || mode === 2 || mode === 3;
+var lilBlendColor = (dst, src, srcA, mode) => {
+  const each = (f) => [0, 1, 2].map(f);
+  const ad = each((i) => dst[i] + src[i]);
+  const mu = mulRgb(dst, src);
+  const screen = each((i) => Math.max(ad[i] - mu[i], dst[i]));
+  const out = [src, ad, screen, mu][isLilBlendMode(mode) ? mode : 0];
+  return lerpRgb(dst, out, srcA);
+};
+var lilOutlineWidth = (width, mask, fixWidth, cameraDistance) => width * 0.01 * mask * lerp(1, saturate(cameraDistance), fixWidth);
+var lilToonShadingInputs = (source, hasTexture) => {
+  const st = source.propertyNode("_MainTex_ST", "vec4");
+  return {
+    float: (name) => source.propertyNode(name, "float"),
+    vec4: (name) => source.propertyNode(name, "vec4"),
+    texture: (name) => hasTexture(name) ? source.textureNode(name) : null,
+    uvMain: uv().mul(st.xy).add(st.zw)
+  };
+};
+var tslSampleST = (inputs, name, at) => {
+  const texture2 = inputs.texture(name);
+  if (!texture2) return vec4(1);
+  const st = inputs.vec4(`${name}_ST`);
+  return texture2.sample(at.mul(st.xy).add(st.zw));
+};
+var tslBlendColor = (dst, src, srcA, mode) => {
+  const ad = dst.add(src);
+  const mu = dst.mul(src);
+  const out = select(
+    mode.equal(1),
+    ad,
+    select(mode.equal(2), max(ad.sub(mu), dst), select(mode.equal(3), mu, src))
+  );
+  return mix(dst, out, srcA);
+};
+var tslBackfaceMask = (value, mask) => select(faceDirection.lessThan(mask.sub(1)), float(0), value);
+var tslNormalByStrength = (normal, geometryNormal, strength) => geometryNormal ? mix(geometryNormal, normal, strength) : normal;
+var tslTooning = (inputs, value, border, blur) => tslBand(
+  value,
+  border,
+  blur,
+  0,
+  fwidth(value).mul(inputs.float("_AAStrength"))
+);
+var tslBacklight = (input) => {
+  const { inputs, normal, lightDirection } = input;
+  const p = inputs.float;
+  const headV = positionViewDirection;
+  const factor = pow(
+    saturate$1(dot(headV, lightDirection).mul(-0.5).add(0.5)),
+    p("_BacklightDirectivity")
+  );
+  const ln = dot(
+    normalize(
+      headV.mul(p("_BacklightViewStrength")).negate().add(lightDirection)
+    ),
+    normal
+  ).mul(0.5).add(0.5);
+  const shadowed = ln.mul(
+    select(
+      p("_BacklightReceiveShadow").notEqual(0),
+      saturate$1(input.shadow),
+      float(1)
+    )
+  );
+  const band = tslTooning(
+    inputs,
+    shadowed,
+    p("_BacklightBorder"),
+    p("_BacklightBlur")
+  );
+  return tslBackfaceMask(
+    saturate$1(factor.mul(band)),
+    p("_BacklightBackfaceMask")
+  );
+};
+var tslBacklightColor = (s, backlight) => {
+  const { inputs } = s;
+  const color = inputs.vec4("_BacklightColor").mul(tslSampleST(inputs, "_BacklightColorTex", inputs.uvMain));
+  const rgb = mix(
+    color.rgb,
+    color.rgb.mul(s.albedo),
+    inputs.float("_BacklightMainStrength")
+  );
+  return rgb.mul(backlight.mul(color.a)).mul(s.lightColor);
+};
+var tslMatCapUV = (inputs, normal) => {
+  const p = inputs.float;
+  const perspective = cameraProjectionMatrix.mul(vec4(0, 0, 0, 1)).w.equal(0).and(p("_MatCapPerspective").notEqual(0));
+  const normalVD = select(perspective, positionViewDirection, vec3(0, 0, 1));
+  const up = select(
+    p("_MatCapZRotCancel").notEqual(0),
+    cameraViewMatrix.mul(vec4(0, 1, 0, 0)).xyz,
+    vec3(0, 1, 0)
+  );
+  const bitangent = normalize(up.sub(normalVD.mul(dot(normalVD, up))));
+  const tangent = cross(bitangent, normalVD);
+  const st = inputs.vec4("_MatCapTex_ST");
+  const matUV = vec2(dot(tangent, normal), dot(bitangent, normal)).mul(st.xy).add(st.zw).mul(0.5).add(0.5);
+  return vec2(matUV.x, matUV.y.oneMinus());
+};
+var tslMatCap = (col, s) => {
+  const { inputs } = s;
+  const p = inputs.float;
+  const normal = tslNormalByStrength(
+    s.normal,
+    s.geometryNormal,
+    p("_MatCapNormalStrength")
+  );
+  const matUV = tslMatCapUV(inputs, normalize(normal));
+  const texture2 = inputs.texture("_MatCapTex");
+  const color = inputs.vec4("_MatCapColor");
+  const sampled = texture2 ? color.mul(texture2.sample(matUV).level(p("_MatCapLod"))) : color;
+  const lit = mix(
+    sampled.rgb,
+    sampled.rgb.mul(s.lightColor),
+    p("_MatCapEnableLighting")
+  );
+  const masked = mix(
+    sampled.a,
+    sampled.a.mul(s.shadowmix),
+    p("_MatCapShadowMask")
+  );
+  const alpha = s.transparent ? select(
+    p("_MatCapApplyTransparency").notEqual(0),
+    masked.mul(s.alpha),
+    masked
+  ) : masked;
+  const facing = tslBackfaceMask(alpha, p("_MatCapBackfaceMask"));
+  const mask = tslSampleST(inputs, "_MatCapBlendMask", inputs.uvMain).rgb;
+  const rgb = mix(lit, lit.mul(s.albedo), p("_MatCapMainStrength"));
+  return tslBlendColor(
+    col,
+    rgb,
+    mask.mul(p("_MatCapBlend").mul(facing)),
+    p("_MatCapBlendMode")
+  );
+};
+var tslRim = (col, s) => {
+  const { inputs } = s;
+  const p = inputs.float;
+  const color = inputs.vec4("_RimColor").mul(tslSampleST(inputs, "_RimColorTex", inputs.uvMain));
+  const rgb = mix(color.rgb, color.rgb.mul(s.albedo), p("_RimMainStrength"));
+  const normal = tslNormalByStrength(
+    s.normal,
+    s.geometryNormal,
+    p("_RimNormalStrength")
+  );
+  const nvabs = abs(dot(normal, positionViewDirection));
+  const fresnel = tslBackfaceMask(
+    pow(saturate$1(nvabs.oneMinus()), p("_RimFresnelPower")),
+    p("_RimBackfaceMask")
+  );
+  const band = tslTooning(inputs, fresnel, p("_RimBorder"), p("_RimBlur"));
+  const rim = s.transparent ? select(p("_RimApplyTransparency").notEqual(0), band.mul(s.alpha), band) : band;
+  const shadowed = mix(rim, rim.mul(s.shadowmix), p("_RimShadowMask"));
+  const lit = mix(rgb, rgb.mul(s.lightColor), p("_RimEnableLighting"));
+  return tslBlendColor(col, lit, shadowed.mul(color.a), p("_RimBlendMode"));
+};
+var tslBlink = (blink) => {
+  const wave = sin(time.mul(blink.z).add(blink.w)).mul(0.5).add(0.5);
+  return mix(
+    float(1),
+    select(blink.y.greaterThan(0.5), round(wave), wave),
+    blink.x
+  );
+};
+var tslEmission = (col, s) => {
+  const { inputs } = s;
+  const p = inputs.float;
+  const color = inputs.vec4("_EmissionColor").mul(tslSampleST(inputs, "_EmissionMap", uv())).mul(tslSampleST(inputs, "_EmissionBlendMask", inputs.uvMain));
+  const invLighting = saturate$1(s.lightColor.oneMinus().mul(sqrt(s.lightColor)));
+  const fluorescent = mix(
+    color.rgb,
+    color.rgb.mul(invLighting),
+    p("_EmissionFluorescence")
+  );
+  const rgb = mix(
+    fluorescent,
+    fluorescent.mul(s.albedo),
+    p("_EmissionMainStrength")
+  );
+  const blend = p("_EmissionBlend").mul(tslBlink(inputs.vec4("_EmissionBlink"))).mul(color.a);
+  return tslBlendColor(
+    col,
+    rgb,
+    s.transparent ? blend.mul(s.alpha) : blend,
+    p("_EmissionBlendMode")
+  );
+};
+var tslOutlinePosition = (inputs, position = positionLocal) => {
+  const p = inputs.float;
+  const texture2 = inputs.texture("_OutlineWidthMask");
+  const mask = texture2 ? texture2.sample(inputs.uvMain).level(float(0)).r : float(1);
+  const positionWS = modelWorldMatrix.mul(vec4(positionLocal, 1)).xyz;
+  const near = saturate$1(length(cameraPosition.sub(positionWS)));
+  const width = p("_OutlineWidth").mul(0.01).mul(mask).mul(mix(float(1), near, p("_OutlineFixWidth")));
+  return position.add(normalize(normalLocal).mul(width));
+};
+var tslOutlineColor = (inputs) => {
+  const texture2 = inputs.texture("_OutlineTex");
+  const color = inputs.vec4("_OutlineColor");
+  return texture2 ? texture2.sample(inputs.uvMain).mul(color) : color;
+};
+var tslOutlineLight = (albedo, lightColor, enable) => mix(albedo, albedo.mul(lightColor), enable);
 
 // src/webgpu/LilToonLightingModel.ts
 var tslHalfLambert = (nDotL) => saturate$1(nDotL.mul(0.5).add(0.5));
@@ -1451,6 +1657,7 @@ var tslBandNoSaturate = (nl, border, blur, borderRange = 0, aa = 0) => {
   const borderMax = saturate$1(border.add(blur.mul(0.5)));
   return nl.sub(borderMin).div(max(saturate$1(borderMax.sub(borderMin).add(aa)), BAND_EPSILON));
 };
+var tslBand = (nl, border, blur, borderRange = 0, aa = 0) => saturate$1(tslBandNoSaturate(nl, border, blur, borderRange, aa));
 var tslAOShift = (mask, shift, shift2) => vec3(
   saturate$1(mask.x.mul(shift.x).add(shift.y)),
   saturate$1(mask.y.mul(shift.z).add(shift.w)),
@@ -1521,18 +1728,25 @@ var LilToonLightingModel = class extends LightingModel {
   #weight = float();
   #bands = vec4();
   #ambient = vec3();
+  #backlight = float();
   #blurMask = vec4(1);
   #borderMask = vec4(1);
+  #inputs;
+  /** fd.origN with a normal map. three negates the normal of a back face, so origN gets the same sign. */
+  #geometryNormal;
   constructor(material, host) {
     super();
     this.material = material;
     this.#host = host;
+    this.#inputs = lilToonShadingInputs(material, host.hasTexture);
+    this.#geometryNormal = host.normalMapped ? negateOnBackSide(normalViewGeometry) : null;
   }
   start(builder) {
     this.#light = vec3().toVar("lilLight");
     this.#weight = float().toVar("lilLightWeight");
     this.#bands = vec4().toVar("lilBands");
     this.#ambient = vec3().toVar("lilAmbient");
+    this.#backlight = float().toVar("lilBacklight");
     if (this.#host.features.has("shadow")) {
       this.#blurMask = this.#maskVar("_ShadowBlurMask", "lilShadowBlurMask");
       this.#borderMask = this.#maskVar(
@@ -1547,20 +1761,41 @@ var LilToonLightingModel = class extends LightingModel {
     const host = this.#host;
     const color = lightColor.mul(UNITY_LIGHT_SCALE);
     this.#light.addAssign(color);
-    if (!host.features.has("shadow")) return;
-    const p = this.#float;
-    const v4 = this.#vec4;
+    const shadowOn = host.features.has("shadow");
+    const backlightOn = host.features.has("backlight");
+    if (!shadowOn && !backlightOn) return;
     const lightNode = input.lightNode;
     const shadowNode = host.shadowed.has(lightNode) ? lightNode.shadowNode : null;
     const shadow = shadowNode ? host.receivedShadow(shadowNode) : float(1);
-    const third = host.features.has("shadow3rd");
-    const ln = tslHalfLambert(normalView.dot(lightDirection));
-    const receive = (name) => tslReceive(ln, shadow, p(name));
+    const weight = tslGray(color);
+    this.#weight.addAssign(weight);
+    if (shadowOn)
+      this.#bands.addAssign(
+        this.#lightBands(lightDirection, shadow).mul(weight)
+      );
+    if (backlightOn)
+      this.#backlight.addAssign(
+        tslBacklight({
+          inputs: this.#inputs,
+          normal: this.#normal("_BacklightNormalStrength"),
+          lightDirection,
+          shadow
+        }).mul(weight)
+      );
+  }
+  /** The shadow bands of one light, lil_common_frag.hlsl:920-1044. */
+  #lightBands(lightDirection, shadow) {
+    const p = this.#float;
+    const v4 = this.#vec4;
+    const third = this.#host.features.has("shadow3rd");
+    const plain = tslHalfLambert(normalView.dot(lightDirection));
+    const ln = (strength) => this.#geometryNormal ? tslHalfLambert(this.#normal(strength).dot(lightDirection)) : plain;
+    const receive = (strength, name) => tslReceive(ln(strength), shadow, p(name));
     const bands = tslShadowBands({
       ln: [
-        receive("_ShadowReceive"),
-        receive("_Shadow2ndReceive"),
-        third ? receive("_Shadow3rdReceive") : float(1)
+        receive("_ShadowNormalStrength", "_ShadowReceive"),
+        receive("_Shadow2ndNormalStrength", "_Shadow2ndReceive"),
+        third ? receive("_Shadow3rdNormalStrength", "_Shadow3rdReceive") : float(1)
       ],
       border: [
         p("_ShadowBorder"),
@@ -1584,9 +1819,7 @@ var LilToonLightingModel = class extends LightingModel {
       float(1),
       float(1).sub(p("_BackfaceForceShadow"))
     );
-    const weight = tslGray(color);
-    this.#weight.addAssign(weight);
-    this.#bands.addAssign(bands.mul(facing).mul(weight));
+    return bands.mul(facing);
   }
   indirect(builder) {
     const { irradiance, iblIrradiance } = builder.context;
@@ -1595,11 +1828,14 @@ var LilToonLightingModel = class extends LightingModel {
   }
   finish(builder) {
     const p = this.#float;
-    const albedo = diffuseColor.rgb;
+    const host = this.#host;
+    const features = host.features;
+    const diffuse = diffuseColor;
+    const albedo = diffuse.rgb;
     const asUnlit = p("_AsUnlit");
-    const light = mix(
+    const limit = (color) => mix(
       tslLimitLight(
-        this.#light,
+        color,
         p("_LightMinLimit"),
         p("_LightMaxLimit"),
         p("_MonochromeLighting")
@@ -1607,20 +1843,65 @@ var LilToonLightingModel = class extends LightingModel {
       vec3(1),
       asUnlit
     );
-    const lit = this.#host.features.has("shadow") ? this.#shade(albedo, light) : albedo.mul(light);
-    const ambient = albedo.mul(this.#ambient).mul(float(1).sub(asUnlit));
+    const lightColor = limit(this.#light.add(this.#ambient));
     const { outgoingLight } = builder.context;
-    outgoingLight.addAssign(lit.add(ambient));
+    if (host.outline) {
+      outgoingLight.addAssign(
+        tslOutlineLight(albedo, lightColor, p("_OutlineEnableLighting"))
+      );
+      return;
+    }
+    const light = limit(this.#light);
+    const lit = features.has("shadow") ? this.#shade(albedo, light) : albedo.mul(light);
+    const ambient = albedo.mul(this.#ambient).mul(float(1).sub(asUnlit));
+    let col = lit.add(ambient);
+    const surface = {
+      inputs: this.#inputs,
+      albedo,
+      alpha: diffuse.a,
+      transparent: host.transparent,
+      lightColor,
+      // lil_common_frag.hlsl:1050: fd.shadowmix = lns.x before `_ShadowStrength`.
+      shadowmix: features.has("shadow") ? this.#normalizedBands().x : float(1),
+      normal: normalView,
+      geometryNormal: this.#geometryNormal
+    };
+    if (features.has("backlight"))
+      col = col.add(tslBacklightColor(surface, this.#normalizedBacklight()));
+    if (features.has("matcap")) col = tslMatCap(col, surface);
+    if (features.has("rim")) col = tslRim(col, surface);
+    if (features.has("emission1st")) col = tslEmission(col, surface);
+    outgoingLight.addAssign(col);
+  }
+  /** The band sum over the weight. A scene without a direct light is lit. */
+  #normalizedBands() {
+    return select(
+      this.#weight.greaterThan(0),
+      this.#bands.div(max(this.#weight, BAND_EPSILON)),
+      vec4(1)
+    );
+  }
+  /** The backlight factor sum over the weight. A scene without a direct light has no backlight. */
+  #normalizedBacklight() {
+    return select(
+      this.#weight.greaterThan(0),
+      this.#backlight.div(max(this.#weight, BAND_EPSILON)),
+      float(0)
+    );
+  }
+  /** fd.N mixed toward fd.origN by one normal strength property, fd.N without a normal map. */
+  #normal(strength) {
+    return tslNormalByStrength(
+      normalView,
+      this.#geometryNormal,
+      this.#float(strength)
+    );
   }
   #shade(albedo, light) {
     const p = this.#float;
     const v4 = this.#vec4;
     const color = (name) => this.#host.hasTexture(name) ? this.#texture(name).sample(this.#uvMain()) : vec4(0);
-    const bands = select(
-      this.#weight.greaterThan(0),
-      this.#bands.div(max(this.#weight, BAND_EPSILON)),
-      vec4(1)
-    );
+    const bands = this.#normalizedBands();
     return tslShade({
       albedo,
       light,
@@ -1759,9 +2040,30 @@ var FEATURE_PROPERTY = {
   outline: "shaderVariant",
   dissolve: "_DissolveParams"
 };
-var UNSUPPORTED_SHADOW_TYPES = ["_ShadowMaskType", "_ShadowColorType"];
+var UNSUPPORTED_VALUES = [
+  ["shadow", "_ShadowMaskType"],
+  ["shadow", "_ShadowColorType"],
+  ["rim", "_RimDirStrength"],
+  ["matcap", "_MatCapCustomNormal"],
+  ["emission1st", "_EmissionMap_UVMode"],
+  ["emission1st", "_EmissionUseGrad"]
+];
+var OUTLINE_UNSUPPORTED_VALUES = ["_OutlineVertexR2Width", "_OutlineZBias"];
+var BLEND_MODES = [
+  ["matcap", "_MatCapBlendMode"],
+  ["rim", "_RimBlendMode"],
+  ["emission1st", "_EmissionBlendMode"]
+];
+var IDENTITY_ST = [1, 1, 0, 0];
 var NODE_EXTRA_DEFAULTS = {
-  _MainTex_ST: [1, 1, 0, 0]
+  _MainTex_ST: IDENTITY_ST,
+  _BumpMap_ST: IDENTITY_ST,
+  _MatCapTex_ST: IDENTITY_ST,
+  _MatCapBlendMask_ST: IDENTITY_ST,
+  _RimColorTex_ST: IDENTITY_ST,
+  _BacklightColorTex_ST: IDENTITY_ST,
+  _EmissionMap_ST: IDENTITY_ST,
+  _EmissionBlendMask_ST: IDENTITY_ST
 };
 function nodeVariant(name) {
   if (name === void 0)
@@ -1858,20 +2160,41 @@ function nodeWarnings(name, properties, _textures, shaderVariant) {
       message: `${property} is enabled, but the WebGPU material does not implement it. The model will load without this feature.`
     });
   }
-  const shadowOn = enabledNodeFeatures(selection.variant, merged).includes(
-    "shadow"
-  );
-  for (const property of UNSUPPORTED_SHADOW_TYPES) {
+  const enabled2 = new Set(enabledNodeFeatures(selection.variant, merged));
+  const warn = (property, message) => warnings.push({
+    severity: "warning",
+    code: "unsupported-feature",
+    materialName: name,
+    shaderKey,
+    property,
+    message
+  });
+  for (const [feature, property] of UNSUPPORTED_VALUES) {
     const value = merged[property];
-    if (!shadowOn || typeof value !== "number" || value === 0) continue;
-    warnings.push({
-      severity: "warning",
-      code: "unsupported-feature",
-      materialName: name,
-      shaderKey,
+    if (!enabled2.has(feature) || typeof value !== "number" || value === 0)
+      continue;
+    warn(
       property,
-      message: `${property} ${value} is not implemented for WebGPU. The material draws it as ${property} 0.`
-    });
+      `${property} ${value} is not implemented for WebGPU. The material draws it as ${property} 0.`
+    );
+  }
+  for (const property of OUTLINE_UNSUPPORTED_VALUES) {
+    const value = merged[property];
+    if (!selection.outline || typeof value !== "number" || value === 0)
+      continue;
+    warn(
+      property,
+      `${property} ${value} is not implemented for WebGPU. The outline draws it as ${property} 0.`
+    );
+  }
+  for (const [feature, property] of BLEND_MODES) {
+    const value = merged[property];
+    if (!enabled2.has(feature) || typeof value !== "number") continue;
+    if (isLilBlendMode(value)) continue;
+    warn(
+      property,
+      `${property} ${value} is not a lilToon blend mode (0-3). The material uses 0.`
+    );
   }
   return warnings;
 }
@@ -1894,10 +2217,20 @@ var neutralFor = (name) => {
   return getNeutralTexture(kind);
 };
 var copyValue = (value) => Array.isArray(value) ? [...value] : value;
+var CULL_SIDE = {
+  0: DoubleSide,
+  1: BackSide,
+  2: FrontSide
+};
 var LilToonNodeMaterial = class extends NodeMaterial {
   isLilToonNodeMaterial = true;
+  /**
+   * The material draws the outline pass: generateLilToonOutlines sets it on the clone it makes. The build reads it,
+   * so set it before the first draw.
+   */
   isOutline = false;
   #variant = "lilToon";
+  #outline = false;
   #mode = "opaque";
   #requestedShader;
   #properties = {};
@@ -1917,10 +2250,15 @@ var LilToonNodeMaterial = class extends NodeMaterial {
     for (const [name, value] of Object.entries(parameters.textures ?? {}))
       this.#assignTexture(name, value);
     this.#applyAlphaMode();
+    this.#applyCull();
     this.setupNodes();
   }
   get variant() {
     return this.#variant;
+  }
+  /** The requested shader has an outline pass, also when the material falls back to lilToon. */
+  get hasOutline() {
+    return this.#outline;
   }
   /** One overridable place for the lighting model. A subclass supplies its own. */
   setupLightingModel() {
@@ -1954,6 +2292,7 @@ var LilToonNodeMaterial = class extends NodeMaterial {
     this.#properties[name] = next;
     this.#syncNode(name, next);
     if (name === "_Cutoff") this.#applyAlphaMode();
+    if (name === "_Cull") this.#applyCull();
     if (this.#programKey() !== before) this.needsUpdate = true;
   }
   getProperty(name) {
@@ -2006,6 +2345,7 @@ var LilToonNodeMaterial = class extends NodeMaterial {
     this.#requestedShader = source.#requestedShader;
     this.#variant = source.#variant;
     this.#mode = source.#mode;
+    this.#outline = source.#outline;
     this.isOutline = source.isOutline;
     this.#properties = Object.fromEntries(
       Object.entries(source.#properties).map(([name, value]) => [
@@ -2026,7 +2366,7 @@ var LilToonNodeMaterial = class extends NodeMaterial {
     this.#requestedShader = shader;
     this.#variant = selection.variant;
     this.#mode = selection.mode;
-    this.isOutline = selection.outline;
+    this.#outline = selection.outline;
   }
   #assignTexture(name, value) {
     this.#textures[name] = value ? normalizeLilToonTexture(name, value) : null;
@@ -2046,13 +2386,80 @@ var LilToonNodeMaterial = class extends NodeMaterial {
    */
   #lightingHost() {
     const textures = { ...this.#textures };
+    const outline = this.isOutline;
     return {
       shadowed: this.#shadowed,
-      features: new Set(this.#features()),
+      // The outline pass draws the outline color only (lil_pass_forward_normal.hlsl, LIL_OUTLINE).
+      features: new Set(outline ? [] : this.#features()),
       hasTexture: (name) => textures[name] != null,
       receivedShadow: (shadow) => this.receivedShadow(shadow),
-      roomIrradiance: (irradiance, iblIrradiance) => this.roomIrradiance(irradiance, iblIrradiance)
+      roomIrradiance: (irradiance, iblIrradiance) => this.roomIrradiance(irradiance, iblIrradiance),
+      outline,
+      transparent: this.#mode === "transparent",
+      normalMapped: this.#normalMapped()
     };
+  }
+  /** LIL_FEATURE_NORMAL_1ST with a `_BumpMap`. The outline pass does not map the normal. */
+  #normalMapped() {
+    return !this.isOutline && this.#features().includes("normal1st") && this.#textures._BumpMap != null;
+  }
+  #shadingInputs() {
+    const textures = { ...this.#textures };
+    return lilToonShadingInputs(this, (name) => textures[name] != null);
+  }
+  /**
+   * The normal: lilUnpackNormalScale of `_BumpMap` with `_BumpScale` (lil_common_frag.hlsl:870-881) through the
+   * three tangent frame. Without tangents, NormalMapNode uses the derivative frame. It does not assign
+   * `normalNode`, so a user normalNode and a later build without the map keep working.
+   */
+  setupNormal() {
+    if (this.normalNode !== null || !this.#normalMapped())
+      return super.setupNormal();
+    const inputs = this.#shadingInputs();
+    const sample = tslSampleST(inputs, "_BumpMap", inputs.uvMain);
+    return this.#withNodes(
+      {
+        normalNode: normalMap(
+          sample.rgb,
+          this.propertyNode("_BumpScale", "float")
+        )
+      },
+      () => super.setupNormal()
+    );
+  }
+  /** The outline pass moves each vertex along its normal (tslOutlinePosition). */
+  setupPosition(builder) {
+    if (!this.isOutline) return super.setupPosition(builder);
+    const position = tslOutlinePosition(
+      this.#shadingInputs(),
+      this.positionNode ?? positionLocal
+    );
+    return this.#withNodes(
+      { positionNode: position },
+      () => super.setupPosition(builder)
+    );
+  }
+  /** The outline pass draws `_OutlineColor` (tslOutlineColor) instead of the main color. */
+  setupDiffuseColor(builder) {
+    if (!this.isOutline) return super.setupDiffuseColor(builder);
+    const color = tslOutlineColor(this.#shadingInputs());
+    this.#withNodes(
+      { colorNode: vec4(color.rgb, 1), opacityNode: color.a },
+      () => super.setupDiffuseColor(builder)
+    );
+  }
+  /** Run `build` with some material nodes replaced, then restore them, so the build does not change the material. */
+  #withNodes(nodes, build) {
+    const keys = Object.keys(nodes);
+    const saved = keys.map((key) => this[key]);
+    Object.assign(this, nodes);
+    try {
+      return build();
+    } finally {
+      keys.forEach((key, i) => {
+        this[key] = saved[i];
+      });
+    }
   }
   #features() {
     return enabledNodeFeatures(this.#variant, this.#properties).filter((feature) => LILTOON_NODE_FEATURES.has(feature)).sort();
@@ -2060,13 +2467,19 @@ var LilToonNodeMaterial = class extends NodeMaterial {
   #programKey() {
     const features = this.#features();
     const present = Object.keys(this.#textures).filter((name) => this.#textures[name] !== null).sort();
-    return `${this.#variant}|${features.join(",")}|${present.join(",")}`;
+    const pass = this.isOutline ? "|outline" : "";
+    return `${this.#variant}|${features.join(",")}|${present.join(",")}${pass}`;
   }
   #applyAlphaMode() {
     const cutoff = this.#properties._Cutoff;
     this.alphaTest = this.#mode === "cutout" && typeof cutoff === "number" ? cutoff : 0;
     this.transparent = this.#mode === "transparent";
     if (this.#mode === "transparent") this.depthWrite = false;
+  }
+  /** `_Cull` to the side. The outline pass draws the back side only (lil_pass_forward_normal.hlsl, Cull Front). */
+  #applyCull() {
+    const cull = this.#properties._Cull;
+    this.side = this.isOutline ? BackSide : CULL_SIDE[typeof cull === "number" ? cull : 2] ?? FrontSide;
   }
   /**
    * Build the nodes that read this material. The constructor and `copy` call it,
@@ -2084,6 +2497,40 @@ var LilToonNodeMaterial = class extends NodeMaterial {
     this.opacityNode = float(color.a).mul(main.a);
   }
 };
+var isMesh = (object) => object.isMesh === true;
+var drawCount = (geometry) => geometry.index ? geometry.index.count : geometry.attributes.position.count;
+var prepareGroups = (geometry) => {
+  const count = drawCount(geometry);
+  const { groups } = geometry;
+  if (groups.length === 0) {
+    geometry.addGroup(0, count, 0);
+    geometry.addGroup(0, count, 1);
+    return true;
+  }
+  return groups.length === 2 && groups.every(
+    (group, i) => group.start === 0 && group.count === count && group.materialIndex === i
+  );
+};
+function generateLilToonOutlines(root) {
+  const outlines = /* @__PURE__ */ new Map();
+  root.traverse((object) => {
+    if (!isMesh(object) || Array.isArray(object.material)) return;
+    const surface = object.material;
+    if (!(surface instanceof LilToonNodeMaterial) || !surface.hasOutline)
+      return;
+    if (surface.isOutline) return;
+    if (!prepareGroups(object.geometry)) return;
+    let outline = outlines.get(surface);
+    if (!outline) {
+      outline = surface.clone();
+      outline.name = `${surface.name} (Outline)`;
+      outline.isOutline = true;
+      outline.side = BackSide;
+      outlines.set(surface, outline);
+    }
+    object.material = [surface, outline];
+  });
+}
 
 // src/webgpu.ts
 var GLTFLilToonNodeExtension = class {
@@ -2091,4 +2538,4 @@ var GLTFLilToonNodeExtension = class {
 var enableLilToonNodeVRM = () => {
 };
 
-export { GLTFLilToonNodeExtension, LILTOON_NODE_FEATURES, LILTOON_NODE_VARIANTS, LilToonLightingModel, LilToonNodeMaterial, UNITY_LIGHT_SCALE, enableLilToonNodeVRM, lilBand, lilLimitLight, nodeProperties, nodeVariant, nodeWarnings };
+export { GLTFLilToonNodeExtension, LILTOON_NODE_FEATURES, LILTOON_NODE_VARIANTS, LilToonLightingModel, LilToonNodeMaterial, UNITY_LIGHT_SCALE, enableLilToonNodeVRM, generateLilToonOutlines, lilBand, lilBlendColor, lilLimitLight, lilOutlineWidth, lilToonShadingInputs, nodeProperties, nodeVariant, nodeWarnings, tslBacklight, tslBacklightColor, tslBlendColor, tslEmission, tslMatCap, tslOutlineColor, tslOutlinePosition, tslRim };

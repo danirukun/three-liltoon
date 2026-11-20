@@ -19,7 +19,9 @@ import {
 	max,
 	min,
 	mix,
+	negateOnBackSide,
 	normalView,
+	normalViewGeometry,
 	saturate,
 	select,
 	uv,
@@ -30,6 +32,18 @@ import {
 import type { LilToonFeatureSet } from "../material/LilToonFeatureSet.js";
 import type { LilToonNodeMaterial } from "./LilToonNodeMaterial.js";
 import { BAND_EPSILON, UNITY_LIGHT_SCALE } from "./lilToonMath.js";
+import {
+	lilToonShadingInputs,
+	tslBacklight,
+	tslBacklightColor,
+	tslEmission,
+	tslMatCap,
+	tslNormalByStrength,
+	tslOutlineLight,
+	tslRim,
+	type LilToonShadingInputs,
+	type LilToonSurface,
+} from "./lilToonShading.js";
 
 type Float = Node<"float">;
 type Vec3 = Node<"vec3">;
@@ -47,6 +61,12 @@ export interface LilToonLightingHost {
 	hasTexture(name: string): boolean;
 	receivedShadow(shadow: Float): Float;
 	roomIrradiance(irradiance: Vec3, iblIrradiance: Vec3): Vec3 | null;
+	/** The material is the outline of generateLilToonOutlines. It draws the outline color only. */
+	outline: boolean;
+	/** LIL_RENDER == 2. */
+	transparent: boolean;
+	/** LIL_FEATURE_NORMAL_1ST with a `_BumpMap`: the material maps the normal, so the normal strengths apply. */
+	normalMapped: boolean;
 }
 
 type LightNode = { shadowNode?: Float | null };
@@ -212,6 +232,8 @@ export const tslShade = (input: TslShadeInput): Vec3 => {
  * each three light with its own bands and sums them: `direct()` adds the light color × UNITY_LIGHT_SCALE to a summed
  * light, and its bands × lilGray(light color) to a band sum. `finish()` divides the band sum by the summed weight
  * and shades the summed light once, as lilGetShading shades the main light. With one light this is the Unity result.
+ * The backlight factor of each light has the same weight. Rim light, matcap, and emission do not depend on the light
+ * direction; `finish()` applies them once to the shaded color, with the summed light, as lilToon does.
  */
 export class LilToonLightingModel extends LightingModel {
 	readonly material: LilToonNodeMaterial;
@@ -220,13 +242,21 @@ export class LilToonLightingModel extends LightingModel {
 	#weight: Float = float();
 	#bands: Vec4 = vec4();
 	#ambient: Vec3 = vec3();
+	#backlight: Float = float();
 	#blurMask: Vec4 = vec4(1);
 	#borderMask: Vec4 = vec4(1);
+	readonly #inputs: LilToonShadingInputs;
+	/** fd.origN with a normal map. three negates the normal of a back face, so origN gets the same sign. */
+	readonly #geometryNormal: Vec3 | null;
 
 	constructor(material: LilToonNodeMaterial, host: LilToonLightingHost) {
 		super();
 		this.material = material;
 		this.#host = host;
+		this.#inputs = lilToonShadingInputs(material, host.hasTexture);
+		this.#geometryNormal = host.normalMapped
+			? negateOnBackSide(normalViewGeometry)
+			: null;
 	}
 
 	override start(builder: NodeBuilder): void {
@@ -234,6 +264,7 @@ export class LilToonLightingModel extends LightingModel {
 		this.#weight = float().toVar("lilLightWeight");
 		this.#bands = vec4().toVar("lilBands");
 		this.#ambient = vec3().toVar("lilAmbient");
+		this.#backlight = float().toVar("lilBacklight");
 		if (this.#host.features.has("shadow")) {
 			// One sample of each mask for all lights.
 			this.#blurMask = this.#maskVar("_ShadowBlurMask", "lilShadowBlurMask");
@@ -253,26 +284,56 @@ export class LilToonLightingModel extends LightingModel {
 		const host = this.#host;
 		const color = lightColor.mul(UNITY_LIGHT_SCALE);
 		this.#light.addAssign(color);
-		if (!host.features.has("shadow")) return;
+		const shadowOn = host.features.has("shadow");
+		const backlightOn = host.features.has("backlight");
+		if (!shadowOn && !backlightOn) return;
 
-		const p = this.#float;
-		const v4 = this.#vec4;
 		const lightNode = input.lightNode as unknown as LightNode;
 		const shadowNode = host.shadowed.has(lightNode)
 			? lightNode.shadowNode
 			: null;
 		const shadow = shadowNode ? host.receivedShadow(shadowNode) : float(1);
-		const third = host.features.has("shadow3rd");
-		// lil_common_frag.hlsl:948-951
-		const ln = tslHalfLambert(normalView.dot(lightDirection));
+		const weight = tslGray(color);
+		this.#weight.addAssign(weight);
+		if (shadowOn)
+			this.#bands.addAssign(
+				this.#lightBands(lightDirection, shadow).mul(weight),
+			);
+		// lil_common_frag.hlsl:1238-1257, for each light.
+		if (backlightOn)
+			this.#backlight.addAssign(
+				tslBacklight({
+					inputs: this.#inputs,
+					normal: this.#normal("_BacklightNormalStrength"),
+					lightDirection,
+					shadow,
+				}).mul(weight),
+			);
+	}
+
+	/** The shadow bands of one light, lil_common_frag.hlsl:920-1044. */
+	#lightBands(lightDirection: Vec3, shadow: Float): Vec4 {
+		const p = this.#float;
+		const v4 = this.#vec4;
+		const third = this.#host.features.has("shadow3rd");
+		// lil_common_frag.hlsl:920-930 (the normal of each band) and 948-951. Without a normal map the three normals are
+		// fd.N, so one value serves all bands.
+		const plain = tslHalfLambert(normalView.dot(lightDirection));
+		const ln = (strength: string) =>
+			this.#geometryNormal
+				? tslHalfLambert(this.#normal(strength).dot(lightDirection))
+				: plain;
 		// lil_common_frag.hlsl:975-979
-		const receive = (name: string) => tslReceive(ln, shadow, p(name));
+		const receive = (strength: string, name: string) =>
+			tslReceive(ln(strength), shadow, p(name));
 		// lil_common_frag.hlsl:983-1033
 		const bands = tslShadowBands({
 			ln: [
-				receive("_ShadowReceive"),
-				receive("_Shadow2ndReceive"),
-				third ? receive("_Shadow3rdReceive") : float(1),
+				receive("_ShadowNormalStrength", "_ShadowReceive"),
+				receive("_Shadow2ndNormalStrength", "_Shadow2ndReceive"),
+				third
+					? receive("_Shadow3rdNormalStrength", "_Shadow3rdReceive")
+					: float(1),
 			],
 			border: [
 				p("_ShadowBorder"),
@@ -297,10 +358,7 @@ export class LilToonLightingModel extends LightingModel {
 			float(1),
 			float(1).sub(p("_BackfaceForceShadow")),
 		);
-		const weight = tslGray(color);
-		this.#weight.addAssign(weight);
-		this.#bands.addAssign(bands.mul(facing).mul(weight));
-		// Task 6 adds the backlight of this light (lilGetBacklight) here.
+		return bands.mul(facing);
 	}
 
 	override indirect(builder: NodeBuilder): void {
@@ -313,28 +371,87 @@ export class LilToonLightingModel extends LightingModel {
 
 	override finish(builder: NodeBuilder): void {
 		const p = this.#float;
-		const albedo = (diffuseColor as unknown as Vec4).rgb;
+		const host = this.#host;
+		const features = host.features;
+		const diffuse = diffuseColor as unknown as Vec4;
+		const albedo = diffuse.rgb;
 		const asUnlit = p("_AsUnlit");
 		// lil_common_macro.hlsl:2086-2088
-		const light = mix(
-			tslLimitLight(
-				this.#light,
-				p("_LightMinLimit"),
-				p("_LightMaxLimit"),
-				p("_MonochromeLighting"),
-			),
-			vec3(1),
-			asUnlit,
-		);
+		const limit = (color: Vec3): Vec3 =>
+			mix(
+				tslLimitLight(
+					color,
+					p("_LightMinLimit"),
+					p("_LightMaxLimit"),
+					p("_MonochromeLighting"),
+				),
+				vec3(1),
+				asUnlit,
+			);
+		// fd.lightColor of the effects: Unity lilToon adds the SH ambient to the main light before the limit.
+		const lightColor = limit(this.#light.add(this.#ambient));
+		const { outgoingLight } = builder.context as unknown as Context;
+		if (host.outline) {
+			// lil_pass_forward_normal.hlsl:255. The outline has no shading, rim, matcap, emission, or backlight.
+			outgoingLight.addAssign(
+				tslOutlineLight(albedo, lightColor, p("_OutlineEnableLighting")),
+			);
+			return;
+		}
+		const light = limit(this.#light);
 		// lil_common_frag.hlsl:1137 without `_UseShadow`.
-		const lit = this.#host.features.has("shadow")
+		const lit = features.has("shadow")
 			? this.#shade(albedo, light)
 			: albedo.mul(light);
 		// Unity lilToon adds the SH ambient to the main light before the limit. Here it is a separate Lambert term,
 		// so a subclass can change it through roomIrradiance(). `_AsUnlit` removes it, as the lerp to 1 does in Unity.
 		const ambient = albedo.mul(this.#ambient).mul(float(1).sub(asUnlit));
-		const { outgoingLight } = builder.context as unknown as Context;
-		outgoingLight.addAssign(lit.add(ambient));
+		let col: Vec3 = lit.add(ambient);
+		const surface: LilToonSurface = {
+			inputs: this.#inputs,
+			albedo,
+			alpha: diffuse.a,
+			transparent: host.transparent,
+			lightColor,
+			// lil_common_frag.hlsl:1050: fd.shadowmix = lns.x before `_ShadowStrength`.
+			shadowmix: features.has("shadow") ? this.#normalizedBands().x : float(1),
+			normal: normalView,
+			geometryNormal: this.#geometryNormal,
+		};
+		// The order of lil_pass_forward_normal.hlsl: backlight, matcap, rim light, emission.
+		if (features.has("backlight"))
+			col = col.add(tslBacklightColor(surface, this.#normalizedBacklight()));
+		if (features.has("matcap")) col = tslMatCap(col, surface);
+		if (features.has("rim")) col = tslRim(col, surface);
+		if (features.has("emission1st")) col = tslEmission(col, surface);
+		outgoingLight.addAssign(col);
+	}
+
+	/** The band sum over the weight. A scene without a direct light is lit. */
+	#normalizedBands(): Vec4 {
+		return select(
+			this.#weight.greaterThan(0),
+			this.#bands.div(max(this.#weight, BAND_EPSILON)),
+			vec4(1),
+		);
+	}
+
+	/** The backlight factor sum over the weight. A scene without a direct light has no backlight. */
+	#normalizedBacklight(): Float {
+		return select(
+			this.#weight.greaterThan(0),
+			this.#backlight.div(max(this.#weight, BAND_EPSILON)),
+			float(0),
+		);
+	}
+
+	/** fd.N mixed toward fd.origN by one normal strength property, fd.N without a normal map. */
+	#normal(strength: string): Vec3 {
+		return tslNormalByStrength(
+			normalView,
+			this.#geometryNormal,
+			this.#float(strength),
+		);
 	}
 
 	#shade(albedo: Vec3, light: Vec3): Vec3 {
@@ -345,12 +462,7 @@ export class LilToonLightingModel extends LightingModel {
 			this.#host.hasTexture(name)
 				? this.#texture(name).sample(this.#uvMain())
 				: vec4(0);
-		// The band sum over the weight. A scene without a direct light is lit.
-		const bands = select(
-			this.#weight.greaterThan(0),
-			this.#bands.div(max(this.#weight, BAND_EPSILON)),
-			vec4(1),
-		);
+		const bands = this.#normalizedBands();
 		return tslShade({
 			albedo,
 			light,

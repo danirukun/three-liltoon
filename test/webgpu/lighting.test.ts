@@ -1,81 +1,10 @@
 import { Texture } from "three";
-import type { Node, NodeBuilder } from "three/webgpu";
-import { float, setCurrentStack, stack, vec3 } from "three/tsl";
+import type { Node } from "three/webgpu";
+import { float, vec3 } from "three/tsl";
 import { describe, expect, it } from "vitest";
 import { LilToonLightingModel } from "../../src/webgpu/LilToonLightingModel";
 import { LilToonNodeMaterial } from "../../src/webgpu/LilToonNodeMaterial";
-
-type Light = { shadowNode: Node | null; baseColorNode: Node | null };
-
-// A stand-in for the r187 lighting context. It builds the node graph only; it does not compile WGSL.
-const fakeContext = () => ({
-	reflectedLight: {
-		directDiffuse: vec3().toVar(),
-		directSpecular: vec3().toVar(),
-		indirectDiffuse: vec3().toVar(),
-		indirectSpecular: vec3().toVar(),
-	},
-	irradiance: vec3(0.2).toVar(),
-	iblIrradiance: vec3(0.1).toVar(),
-	outgoingLight: vec3().toVar(),
-});
-
-const runModel = (
-	source: LilToonNodeMaterial | LilToonLightingModel,
-	lights: Light[],
-) => {
-	const model =
-		source instanceof LilToonLightingModel
-			? source
-			: (source.setupLightingModel() as LilToonLightingModel);
-	const context = fakeContext();
-	const builder = {
-		context,
-		lightsNode: {
-			setupLights: () => {
-				for (const lightNode of lights)
-					model.direct({
-						lightDirection: vec3(0, 0, 1),
-						lightColor: vec3(1, 1, 1),
-						lightNode,
-						reflectedLight: context.reflectedLight,
-					} as never);
-			},
-			getLightNodes: () => [],
-		},
-	} as unknown as NodeBuilder;
-	// The assignments go into a stack, as in LightsNode.setup.
-	const nodes = stack();
-	setCurrentStack(nodes);
-	try {
-		model.start(builder);
-		model.finish(builder);
-	} finally {
-		setCurrentStack(null);
-	}
-	// The assignment statements, by the name of their target variable.
-	const assigned = (nodes.nodes as { targetNode?: Node & { name?: string } }[])
-		.map((node) => node.targetNode)
-		.filter((target) => target !== undefined)
-		.map((target) =>
-			target === context.outgoingLight ? "outgoingLight" : target.name,
-		);
-	return { ...context, assigned };
-};
-
-// The getShadow hook that setupLighting puts into the lighting context.
-const getShadowOf = (material: LilToonNodeMaterial) => {
-	const builder = {
-		material,
-		renderer: { lighting: { enabled: true } },
-		lightsNode: { getScope: () => ({ hasLights: true }) },
-		context: {},
-	} as unknown as NodeBuilder;
-	const node = material.setupLighting(builder) as unknown as {
-		value: { getShadow: (light: Light) => Node | null };
-	};
-	return node.value.getShadow;
-};
+import { getShadowOf, runModel, type Light } from "./fakeLighting";
 
 describe("LilToonLightingModel", () => {
 	it("is the lighting model of the material and holds it", () => {

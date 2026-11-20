@@ -224,3 +224,37 @@ export const lilShade = (input: LilShadeInput): [number, number, number] => {
 	// 1133: fd.col.rgb = lerp(indirectCol, directCol, lns.x)
 	return lerpRgb(indirect, direct, first);
 };
+
+/** The lilToon blend modes of lilBlendColor: 0 Normal, 1 Add, 2 Screen, 3 Multiply. */
+export const isLilBlendMode = (mode: number): boolean =>
+	mode === 0 || mode === 1 || mode === 2 || mode === 3;
+
+/**
+ * lilBlendColor, lil_common_functions.hlsl:325-340. The HLSL leaves `outCol` unset for a mode outside 0-3. This
+ * port draws such a mode as 0, and nodeWarnings reports it.
+ */
+export const lilBlendColor = (
+	dst: Rgb,
+	src: Rgb,
+	srcA: number | Rgb,
+	mode: number,
+): [number, number, number] => {
+	const each = (f: (i: number) => number) =>
+		[0, 1, 2].map(f) as [number, number, number];
+	const ad = each((i) => dst[i]! + src[i]!);
+	const mu = mulRgb(dst, src);
+	const screen = each((i) => Math.max(ad[i]! - mu[i]!, dst[i]!));
+	const out = [src, ad, screen, mu][isLilBlendMode(mode) ? mode : 0]!;
+	return lerpRgb(dst, out, srcA);
+};
+
+/**
+ * lilGetOutlineWidth with `_OutlineVertexR2Width` 0, lil_common_functions.hlsl:273-290: `_OutlineWidth` is in
+ * centimetres, times the `_OutlineWidthMask` red channel. `_OutlineFixWidth` narrows it within 1 m of the camera.
+ */
+export const lilOutlineWidth = (
+	width: number,
+	mask: number,
+	fixWidth: number,
+	cameraDistance: number,
+): number => width * 0.01 * mask * lerp(1, saturate(cameraDistance), fixWidth);

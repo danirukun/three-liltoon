@@ -10,8 +10,24 @@ export {
 export {
 	UNITY_LIGHT_SCALE,
 	lilBand,
+	lilBlendColor,
 	lilLimitLight,
+	lilOutlineWidth,
 } from "./webgpu/lilToonMath.js";
+export {
+	lilToonShadingInputs,
+	tslBacklight,
+	tslBacklightColor,
+	tslBlendColor,
+	tslEmission,
+	tslMatCap,
+	tslOutlineColor,
+	tslOutlinePosition,
+	tslRim,
+	type LilToonShadingInputs,
+	type LilToonSurface,
+} from "./webgpu/lilToonShading.js";
+export { generateLilToonOutlines } from "./webgpu/outlines.js";
 export {
 	LILTOON_NODE_FEATURES,
 	LILTOON_NODE_VARIANTS,
