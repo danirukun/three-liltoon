@@ -77,8 +77,8 @@ describe("LilToonLightingModel", () => {
 				_ShadowBorderMask: new Texture(),
 			},
 		});
-		const light: Light = { shadowNode: null, baseColorNode: null };
-		const { assigned } = runModel(material, [light, light]);
+		const light = (): Light => ({ shadowNode: null, baseColorNode: null });
+		const { assigned } = runModel(material, [light(), light()]);
 		expect(assigned).toEqual([
 			"lilShadowBlurMask",
 			"lilShadowBorderMask",
@@ -86,11 +86,64 @@ describe("LilToonLightingModel", () => {
 			"lilLightWeight",
 			"lilBands",
 			"lilLight",
-			"lilLightWeight",
-			"lilBands",
 			"lilAmbient",
 			"outgoingLight",
 		]);
+	});
+
+	it("shades the bands of the first directional light only", () => {
+		const material = new LilToonNodeMaterial({ properties: { _UseShadow: 1 } });
+		const point: Light = { shadowNode: null, baseColorNode: null, light: {} };
+		const sun: Light = {
+			shadowNode: null,
+			baseColorNode: null,
+			light: { isDirectionalLight: true },
+		};
+		const { assigned } = runModel(material, [point, sun, point]);
+		// Unity lilToon shades the main light with the bands and adds the other lights to the light color only.
+		expect(assigned).toEqual([
+			"lilLight",
+			"lilLight",
+			"lilLightWeight",
+			"lilBands",
+			"lilLight",
+			"lilAmbient",
+			"outgoingLight",
+		]);
+	});
+
+	it("shades the first light when the set has no directional light", () => {
+		const material = new LilToonNodeMaterial({ properties: { _UseShadow: 1 } });
+		const spot = (): Light => ({ shadowNode: null, baseColorNode: null, light: {} });
+		const { assigned } = runModel(material, [spot(), spot()]);
+		expect(assigned).toEqual([
+			"lilLight",
+			"lilLightWeight",
+			"lilBands",
+			"lilLight",
+			"lilAmbient",
+			"outgoingLight",
+		]);
+	});
+
+	it("adds another light with its received shadow and no bands", () => {
+		const seen: Node[] = [];
+		class Sub extends LilToonNodeMaterial {
+			protected override receivedShadow(shadow: Node<"float">): Node<"float"> {
+				seen.push(shadow);
+				return shadow;
+			}
+		}
+		const material = new Sub({ properties: { _UseShadow: 1, _ShadowReceive: 1 } });
+		const main: Light = { shadowNode: null, baseColorNode: null };
+		const shadowed: Light = { shadowNode: float(0.3), baseColorNode: vec3(1) };
+		getShadowOf(material)(shadowed);
+		const { sourcesOf } = runModel(material, [main, shadowed]);
+		expect(seen).toEqual([shadowed.shadowNode]);
+		const added = sourcesOf("lilLight");
+		expect(added).toHaveLength(2);
+		expect(contains(added[1], shadowed.shadowNode!)).toBe(true);
+		expect(sourcesOf("lilBands")).toHaveLength(1);
 	});
 
 	it("passes the context irradiance to the roomIrradiance hook of a subclass", () => {

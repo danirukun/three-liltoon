@@ -3,7 +3,11 @@ import { setCurrentStack, stack, vec3 } from "three/tsl";
 import { LilToonLightingModel } from "../../src/webgpu/LilToonLightingModel";
 import type { LilToonNodeMaterial } from "../../src/webgpu/LilToonNodeMaterial";
 
-export type Light = { shadowNode: Node | null; baseColorNode: Node | null };
+export type Light = {
+	shadowNode: Node | null;
+	baseColorNode: Node | null;
+	light?: { isDirectionalLight?: boolean };
+};
 
 // A stand-in for the r187 lighting context. It builds the node graph only; it does not compile WGSL.
 const fakeContext = () => ({
@@ -44,7 +48,7 @@ export const runModel = (
 						reflectedLight: context.reflectedLight,
 					} as never);
 			},
-			getLightNodes: () => [],
+			getLightNodes: () => lights,
 		},
 	} as unknown as NodeBuilder;
 	// The assignments go into a stack, as in LightsNode.setup.

@@ -122,14 +122,12 @@ describe("LilToonNodeMaterial shading features", () => {
 				_BacklightColorTex: new Texture(),
 			},
 		});
-		const { assigned, outgoing } = runModel(material, [light, light]);
+		const { assigned, outgoing } = runModel(material, [light, { ...light }]);
 		expect(assigned).toEqual([
 			"lilLight",
 			"lilLightWeight",
 			"lilBacklight",
 			"lilLight",
-			"lilLightWeight",
-			"lilBacklight",
 			"lilAmbient",
 			"outgoingLight",
 		]);

@@ -228,14 +228,15 @@ export const tslShade = (input: TslShadeInput): Vec3 => {
 /**
  * The lilToon lighting of LilToonNodeMaterial.
  *
- * Unity lilToon shades one main light (the directional light plus the SH ambient) with the bands. This model shades
- * each three light with its own bands and sums them: `direct()` adds the light color × UNITY_LIGHT_SCALE to a summed
- * light, and its bands × lilGray(light color) to a band sum. `indirect()` keeps the ambient (the scene irradiance, or
- * what the roomIrradiance hook returns, over π). `finish()` divides the band sum by the summed weight, adds the
- * ambient to the summed light, limits that light color once, and shades it, as lilGetShading shades the main light.
- * With one light this is the Unity result.
- * The backlight factor of each light has the same weight. Rim light, matcap, and emission do not depend on the light
- * direction; `finish()` applies them once to the shaded color, with the summed light, as lilToon does.
+ * Unity lilToon shades one main light (the directional light plus the SH ambient) with the bands and adds the other
+ * lights to the light color. This model does the same. The main light is the first directional light of the build,
+ * else the first light that reaches `direct()`. `direct()` adds the light color × UNITY_LIGHT_SCALE of each light to a
+ * summed light (another light with its received shadow), and for the main light its bands and backlight factor ×
+ * lilGray(light color). `indirect()` keeps the ambient (the scene irradiance, or what the roomIrradiance hook returns,
+ * over π). `finish()` divides the bands by the weight, adds the ambient to the summed light, limits that light color
+ * once, and shades it, as lilGetShading shades the main light. With one light this is the Unity result.
+ * Rim light, matcap, and emission do not depend on the light direction; `finish()` applies them once to the shaded
+ * color, with the summed light, as lilToon does.
  */
 export class LilToonLightingModel extends LightingModel {
 	readonly material: LilToonNodeMaterial;
@@ -245,6 +246,7 @@ export class LilToonLightingModel extends LightingModel {
 	#bands: Vec4 = vec4();
 	#ambient: Vec3 = vec3();
 	#backlight: Float = float();
+	#main: unknown = null;
 	#blurMask: Vec4 = vec4(1);
 	#borderMask: Vec4 = vec4(1);
 	readonly #inputs: LilToonShadingInputs;
@@ -266,6 +268,17 @@ export class LilToonLightingModel extends LightingModel {
 	}
 
 	override start(builder: NodeBuilder): void {
+		const lightNodes = (
+			builder as unknown as {
+				lightsNode?: { getLightNodes(builder: NodeBuilder): unknown[] };
+			}
+		).lightsNode?.getLightNodes(builder);
+		this.#main =
+			lightNodes?.find(
+				(node) =>
+					(node as { light?: { isDirectionalLight?: boolean } }).light
+						?.isDirectionalLight === true,
+			) ?? null;
 		this.#light = vec3().toVar("lilLight");
 		this.#weight = float().toVar("lilLightWeight");
 		// vec4() with no value is a Vector4, whose w is 1: the border band would start at 1 and extrapolate past the lit color.
@@ -290,15 +303,23 @@ export class LilToonLightingModel extends LightingModel {
 		};
 		const host = this.#host;
 		const color = lightColor.mul(UNITY_LIGHT_SCALE);
+		const lightNode = input.lightNode as unknown as LightNode;
+		const shadowNode = host.shadowed.has(lightNode)
+			? lightNode.shadowNode
+			: null;
+		this.#main ??= lightNode;
+		if (lightNode !== this.#main) {
+			// lilGetAdditionalLights: another light adds its color with its shadow, and no bands.
+			this.#light.addAssign(
+				shadowNode ? color.mul(host.receivedShadow(shadowNode)) : color,
+			);
+			return;
+		}
 		this.#light.addAssign(color);
 		const shadowOn = host.features.has("shadow");
 		const backlightOn = host.features.has("backlight");
 		if (!shadowOn && !backlightOn) return;
 
-		const lightNode = input.lightNode as unknown as LightNode;
-		const shadowNode = host.shadowed.has(lightNode)
-			? lightNode.shadowNode
-			: null;
 		const shadow = shadowNode ? host.receivedShadow(shadowNode) : float(1);
 		const weight = tslGray(color);
 		this.#weight.addAssign(weight);

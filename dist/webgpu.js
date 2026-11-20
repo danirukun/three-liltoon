@@ -1736,6 +1736,7 @@ var LilToonLightingModel = class extends LightingModel {
   #bands = vec4();
   #ambient = vec3();
   #backlight = float();
+  #main = null;
   #blurMask = vec4(1);
   #borderMask = vec4(1);
   #inputs;
@@ -1755,6 +1756,10 @@ var LilToonLightingModel = class extends LightingModel {
     this.#geometryNormal = host.normalMapped ? normalViewGeometry : null;
   }
   start(builder) {
+    const lightNodes = builder.lightsNode?.getLightNodes(builder);
+    this.#main = lightNodes?.find(
+      (node) => node.light?.isDirectionalLight === true
+    ) ?? null;
     this.#light = vec3().toVar("lilLight");
     this.#weight = float().toVar("lilLightWeight");
     this.#bands = vec4(0, 0, 0, 0).toVar("lilBands");
@@ -1773,12 +1778,19 @@ var LilToonLightingModel = class extends LightingModel {
     const { lightDirection, lightColor } = input;
     const host = this.#host;
     const color = lightColor.mul(UNITY_LIGHT_SCALE);
+    const lightNode = input.lightNode;
+    const shadowNode = host.shadowed.has(lightNode) ? lightNode.shadowNode : null;
+    this.#main ??= lightNode;
+    if (lightNode !== this.#main) {
+      this.#light.addAssign(
+        shadowNode ? color.mul(host.receivedShadow(shadowNode)) : color
+      );
+      return;
+    }
     this.#light.addAssign(color);
     const shadowOn = host.features.has("shadow");
     const backlightOn = host.features.has("backlight");
     if (!shadowOn && !backlightOn) return;
-    const lightNode = input.lightNode;
-    const shadowNode = host.shadowed.has(lightNode) ? lightNode.shadowNode : null;
     const shadow = shadowNode ? host.receivedShadow(shadowNode) : float(1);
     const weight = tslGray(color);
     this.#weight.addAssign(weight);
@@ -2284,7 +2296,9 @@ var LilToonTextureNode = class extends TextureNode {
     this.#sync(builder);
     return super.setup(builder);
   }
-  updateBefore(frame) {
+  // The update phase, not the update-before phase: three r187 renders a shadow map in the update-before phase of
+  // the first draw, and its caster draws sync this node to their own textures.
+  update(frame) {
     this.#sync(frame);
     return void 0;
   }
@@ -2469,7 +2483,7 @@ var LilToonNodeMaterial = class _LilToonNodeMaterial extends NodeMaterial {
       node.slot = name;
       node.read = (state, slot) => _LilToonNodeMaterial.#drawn(state)?.getTexture(slot);
       node.mergeable = false;
-      node.updateBeforeType = NodeUpdateType.OBJECT;
+      node.updateType = NodeUpdateType.OBJECT;
       nodes.set(name, node);
     }
     node.value = this.getTexture(name);

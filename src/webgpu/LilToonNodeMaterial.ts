@@ -109,7 +109,7 @@ type DrawState = {
 
 /**
  * The shared texture node of one slot. The nodes that `sample` and `level` clone from it read its value, so one
- * update before each draw sets the texture for all of them. The sampler state is in the program key, so the node key
+ * update in each draw sets the texture for all of them. The sampler state is in the program key, so the node key
  * is the node id only: the texture of the last draw must not change the key.
  */
 class LilToonTextureNode extends TextureNodeBase {
@@ -128,7 +128,9 @@ class LilToonTextureNode extends TextureNodeBase {
 		return super.setup(builder);
 	}
 
-	override updateBefore(frame: NodeFrame): undefined {
+	// The update phase, not the update-before phase: three r187 renders a shadow map in the update-before phase of
+	// the first draw, and its caster draws sync this node to their own textures.
+	override update(frame: NodeFrame): undefined {
 		this.#sync(frame as unknown as DrawState);
 		return undefined;
 	}
@@ -359,7 +361,7 @@ export class LilToonNodeMaterial extends NodeMaterial {
 				LilToonNodeMaterial.#drawn(state)?.getTexture(slot);
 			// Not merged with another slot that has the same texture at build time.
 			node.mergeable = false;
-			node.updateBeforeType = NodeUpdateType.OBJECT;
+			node.updateType = NodeUpdateType.OBJECT;
 			nodes.set(name, node);
 		}
 		node.value = this.getTexture(name);

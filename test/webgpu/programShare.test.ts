@@ -1,5 +1,5 @@
 import { FloatType, NearestFilter, Texture } from "three";
-import { NodeMaterial } from "three/webgpu";
+import { NodeMaterial, NodeUpdateType } from "three/webgpu";
 import type { NodeFrame } from "three/webgpu";
 import { describe, expect, it } from "vitest";
 import { LilToonNodeMaterial } from "../../src/webgpu/LilToonNodeMaterial";
@@ -70,7 +70,7 @@ describe("LilToonNodeMaterial program share", () => {
 		const nearest = new Texture();
 		nearest.magFilter = NearestFilter;
 		const b = outlineMaterial({}, nearest);
-		a.textureNode("_MainTex").updateBefore(drawOf(b));
+		a.textureNode("_MainTex").update(drawOf(b));
 		expect(a.customProgramCacheKey()).toBe(key);
 	});
 });
@@ -113,14 +113,28 @@ describe("LilToonNodeMaterial shared nodes", () => {
 		expect(b.textureNode("_MainTex")).toBe(main);
 		const sampled = main.sample(main.uvNode ?? main.getDefaultUV());
 
-		main.updateBefore(drawOf(b));
+		main.update(drawOf(b));
 		expect(sampled.value).toBe(mainB);
-		main.updateBefore(drawOf(a));
+		main.update(drawOf(a));
 		expect(sampled.value).toBe(mainA);
 		b.setTexture("_MainTex", null);
-		main.updateBefore(drawOf(b));
+		main.update(drawOf(b));
 		expect(sampled.value).toBe(b.getTexture("_MainTex"));
 		expect(sampled.value).not.toBe(mainB);
+	});
+
+	it("sets the texture in the update phase, so a shadow render in the update-before phase does not replace it", () => {
+		const mainA = new Texture();
+		const a = outlineMaterial({}, mainA);
+		const b = outlineMaterial({}, new Texture());
+		const main = a.textureNode("_MainTex");
+		// r187 renders a shadow map in the update-before phase of the first draw. Its caster draws sync the shared node
+		// to their own texture; the update phase of the outer draw must come after them.
+		expect(main.updateBeforeType).toBe(NodeUpdateType.NONE);
+		expect(main.updateType).toBe(NodeUpdateType.OBJECT);
+		main.update(drawOf(new NodeMaterial(), b));
+		main.update(drawOf(a));
+		expect(main.value).toBe(mainA);
 	});
 
 	it("reads the source material in a shadow pass", () => {
@@ -130,10 +144,10 @@ describe("LilToonNodeMaterial shared nodes", () => {
 		const color = a.propertyNode("_Color", "vec4");
 		const texture = a.textureNode("_MainTex");
 		color.update(drawOf(b));
-		texture.updateBefore(drawOf(b));
+		texture.update(drawOf(b));
 		const shadow = new NodeMaterial();
 		color.update(drawOf(shadow, a));
-		texture.updateBefore(drawOf(shadow, a));
+		texture.update(drawOf(shadow, a));
 		expect(color.value.toArray()).toEqual([1, 0, 0, 0.5]);
 		expect(texture.value).toBe(main);
 	});
