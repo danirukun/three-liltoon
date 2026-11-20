@@ -275,6 +275,15 @@ export class LilToonNodeMaterial extends NodeMaterial {
 	}
 
 	/**
+	 * `true` applies the received shadow after the bands, as MToon does: the bands take the lit value, and each band is
+	 * then multiplied by `lerp(1, shadow, _ShadowReceive)` of its band. `false` (lilToon) multiplies the shadow into the
+	 * half Lambert value before the bands (lil_common_frag.hlsl:975-979). A subclass overrides it.
+	 */
+	protected receivedShadowAfterBands(): boolean {
+		return false;
+	}
+
+	/**
 	 * The irradiance of the ambient term. `irradiance` is the scene ambient (ambient, hemisphere, and probe lights);
 	 * `iblIrradiance` is what `setupEnvironment()` adds. `null` uses `irradiance`. A subclass overrides it.
 	 */
@@ -466,6 +475,7 @@ export class LilToonNodeMaterial extends NodeMaterial {
 			features: new Set(outline ? [] : this.#features()),
 			hasTexture: (name) => textures[name] != null,
 			receivedShadow: (shadow) => this.receivedShadow(shadow),
+			shadowAfterBands: this.receivedShadowAfterBands(),
 			roomIrradiance: (irradiance, iblIrradiance) =>
 				this.roomIrradiance(irradiance, iblIrradiance),
 			outline,
@@ -572,7 +582,8 @@ export class LilToonNodeMaterial extends NodeMaterial {
 			.sort()
 			.map((name) => `${name}{${textureKey(this.#textures[name]!)}}`);
 		const pass = this.isOutline ? "|outline" : "";
-		return `${this.#variant}|${features.join(",")}|${present.join(",")}${pass}`;
+		const shadow = this.receivedShadowAfterBands() ? "|shadowAfterBands" : "";
+		return `${this.#variant}|${features.join(",")}|${present.join(",")}${pass}${shadow}`;
 	}
 
 	#applyAlphaMode(): void {

@@ -60,6 +60,8 @@ export interface LilToonLightingHost {
 	features: ReadonlySet<keyof LilToonFeatureSet>;
 	hasTexture(name: string): boolean;
 	receivedShadow(shadow: Float): Float;
+	/** The received shadow multiplies the bands after the band step (MToon) instead of the half Lambert value (lilToon). */
+	shadowAfterBands: boolean;
 	roomIrradiance(irradiance: Vec3, iblIrradiance: Vec3): Vec3 | null;
 	/** The material is the outline of generateLilToonOutlines. It draws the outline color only. */
 	outline: boolean;
@@ -228,20 +230,22 @@ export const tslShade = (input: TslShadeInput): Vec3 => {
 /**
  * The lilToon lighting of LilToonNodeMaterial.
  *
- * Unity lilToon shades one main light (the directional light plus the SH ambient) with the bands and adds the other
- * lights to the light color. This model does the same. The main light is the first directional light of the build,
- * else the first light that reaches `direct()`. `direct()` adds the light color × UNITY_LIGHT_SCALE of each light to a
- * summed light (another light with its received shadow), and for the main light its bands and backlight factor ×
- * lilGray(light color). `indirect()` keeps the ambient (the scene irradiance, or what the roomIrradiance hook returns,
- * over π). `finish()` divides the bands by the weight, adds the ambient to the summed light, limits that light color
- * once, and shades it, as lilGetShading shades the main light. With one light this is the Unity result.
+ * Unity lilToon (built-in pipeline) shades one main light (the directional light plus the SH ambient) in the base pass,
+ * and each other per-pixel light in a ForwardAdd pass that adds its color. This model does the same in one pass. The
+ * main light is the first directional light of the build, else the first light that reaches `direct()`. `direct()`
+ * keeps the light color × UNITY_LIGHT_SCALE of the main light with its bands and backlight factor × lilGray(light
+ * color), and adds the ForwardAdd color of each other light: its own light limit, no bands, and no ambient.
+ * `indirect()` keeps the ambient (the scene irradiance, or what the roomIrradiance hook returns, over π). `finish()`
+ * divides the bands by the weight, adds the ambient to the main light, limits that light color once, shades it as
+ * lilGetShading shades the main light, and adds the ForwardAdd colors.
  * Rim light, matcap, and emission do not depend on the light direction; `finish()` applies them once to the shaded
- * color, with the summed light, as lilToon does.
+ * color of the main light, as the base pass does. The ForwardAdd terms of these effects are not ported.
  */
 export class LilToonLightingModel extends LightingModel {
 	readonly material: LilToonNodeMaterial;
 	readonly #host: LilToonLightingHost;
 	#light: Vec3 = vec3();
+	#added: Vec3 = vec3();
 	#weight: Float = float();
 	#bands: Vec4 = vec4();
 	#ambient: Vec3 = vec3();
@@ -280,6 +284,7 @@ export class LilToonLightingModel extends LightingModel {
 						?.isDirectionalLight === true,
 			) ?? null;
 		this.#light = vec3().toVar("lilLight");
+		this.#added = vec3().toVar("lilAddedLight");
 		this.#weight = float().toVar("lilLightWeight");
 		// vec4() with no value is a Vector4, whose w is 1: the border band would start at 1 and extrapolate past the lit color.
 		this.#bands = vec4(0, 0, 0, 0).toVar("lilBands");
@@ -307,12 +312,10 @@ export class LilToonLightingModel extends LightingModel {
 		const shadowNode = host.shadowed.has(lightNode)
 			? lightNode.shadowNode
 			: null;
+		const shadow = shadowNode ? host.receivedShadow(shadowNode) : float(1);
 		this.#main ??= lightNode;
 		if (lightNode !== this.#main) {
-			// lilGetAdditionalLights: another light adds its color with its shadow, and no bands.
-			this.#light.addAssign(
-				shadowNode ? color.mul(host.receivedShadow(shadowNode)) : color,
-			);
+			this.#added.addAssign(this.#addedLight(color.mul(shadow)));
 			return;
 		}
 		this.#light.addAssign(color);
@@ -320,7 +323,6 @@ export class LilToonLightingModel extends LightingModel {
 		const backlightOn = host.features.has("backlight");
 		if (!shadowOn && !backlightOn) return;
 
-		const shadow = shadowNode ? host.receivedShadow(shadowNode) : float(1);
 		const weight = tslGray(color);
 		this.#weight.addAssign(weight);
 		if (shadowOn)
@@ -339,11 +341,33 @@ export class LilToonLightingModel extends LightingModel {
 			);
 	}
 
+	/**
+	 * The color that the ForwardAdd pass adds for another light, with the light limit of LIL_GET_MAINLIGHT in
+	 * LIL_PASS_FORWARDADD (lil_common_macro.hlsl:2146-2150): min(color × attenuation, `_LightMaxLimit`), with no lower
+	 * limit, and no light with `_AsUnlit`. Unity shades this light with its own bands (lil_pass_forward_normal.hlsl:463-469);
+	 * this port adds albedo × light, because a band set for each light makes the program of a light set too slow to build
+	 * when a light comes or goes. The outline pass adds albedo × light × `_OutlineEnableLighting` (253).
+	 */
+	#addedLight(attenuated: Vec3): Vec3 {
+		const p = this.#float;
+		const albedo = (diffuseColor as unknown as Vec4).rgb;
+		const limited = min(attenuated, vec3(p("_LightMaxLimit")));
+		const light = mix(
+			mix(limited, vec3(tslGray(limited)), p("_MonochromeLighting")),
+			vec3(0),
+			p("_AsUnlit"),
+		);
+		return this.#host.outline
+			? albedo.mul(light).mul(p("_OutlineEnableLighting"))
+			: albedo.mul(light);
+	}
+
 	/** The shadow bands of one light, lil_common_frag.hlsl:920-1044. */
 	#lightBands(lightDirection: Vec3, shadow: Float): Vec4 {
 		const p = this.#float;
 		const v4 = this.#vec4;
 		const third = this.#host.features.has("shadow3rd");
+		const after = this.#host.shadowAfterBands;
 		// lil_common_frag.hlsl:920-930 (the normal of each band) and 948-951. Without a normal map the three normals are
 		// fd.N, so one value serves all bands.
 		const plain = tslHalfLambert(this.#normalN.dot(lightDirection));
@@ -351,9 +375,9 @@ export class LilToonLightingModel extends LightingModel {
 			this.#geometryNormal
 				? tslHalfLambert(this.#normal(strength).dot(lightDirection))
 				: plain;
-		// lil_common_frag.hlsl:975-979
+		// lil_common_frag.hlsl:975-979. With shadowAfterBands the bands take the lit value, and the shadow comes below.
 		const receive = (strength: string, name: string) =>
-			tslReceive(ln(strength), shadow, p(name));
+			after ? ln(strength) : tslReceive(ln(strength), shadow, p(name));
 		// lil_common_frag.hlsl:983-1033
 		const bands = tslShadowBands({
 			ln: [
@@ -386,7 +410,20 @@ export class LilToonLightingModel extends LightingModel {
 			float(1),
 			float(1).sub(p("_BackfaceForceShadow")),
 		);
-		return bands.mul(facing);
+		if (!after) return bands.mul(facing);
+		// MToon: the shadow multiplies the toon step, lerp(1, shadow, receive) for each band. lns.w is the border of band 1.
+		const received = (name: string) => mix(float(1), saturate(shadow), p(name));
+		const first = received("_ShadowReceive");
+		return bands
+			.mul(
+				vec4(
+					first,
+					received("_Shadow2ndReceive"),
+					third ? received("_Shadow3rdReceive") : float(1),
+					first,
+				),
+			)
+			.mul(facing);
 	}
 
 	override indirect(builder: NodeBuilder): void {
@@ -425,13 +462,22 @@ export class LilToonLightingModel extends LightingModel {
 		if (host.outline) {
 			// lil_pass_forward_normal.hlsl:255. The outline has no shading, rim, matcap, emission, or backlight.
 			outgoingLight.addAssign(
-				tslOutlineLight(albedo, lightColor, p("_OutlineEnableLighting")),
+				tslOutlineLight(albedo, lightColor, p("_OutlineEnableLighting")).add(
+					this.#added,
+				),
 			);
 			return;
 		}
 		// lil_common_frag.hlsl:1137 without `_UseShadow`.
 		let col: Vec3 = features.has("shadow")
-			? this.#shade(albedo, lightColor)
+			? this.#shade(
+					albedo,
+					lightColor,
+					this.#normalizedBands(),
+					// fd.indLightColor = saturate(shMin) (lil_common_functions.hlsl:1022): the ambient before the light
+					// limit, read by `_ShadowEnvStrength` only (lil_common_frag.hlsl:1125).
+					saturate(this.#ambient),
+				)
 			: albedo.mul(lightColor);
 		const surface: LilToonSurface = {
 			inputs: this.#inputs,
@@ -450,7 +496,7 @@ export class LilToonLightingModel extends LightingModel {
 		if (features.has("matcap")) col = tslMatCap(col, surface);
 		if (features.has("rim")) col = tslRim(col, surface);
 		if (features.has("emission1st")) col = tslEmission(col, surface);
-		outgoingLight.addAssign(col);
+		outgoingLight.addAssign(col.add(this.#added));
 	}
 
 	/** The band sum over the weight. A scene without a direct light is lit. */
@@ -480,7 +526,8 @@ export class LilToonLightingModel extends LightingModel {
 		);
 	}
 
-	#shade(albedo: Vec3, light: Vec3): Vec3 {
+	/** lilGetShading for one light color, its bands, and the environment light of `_ShadowEnvStrength`. */
+	#shade(albedo: Vec3, light: Vec3, bands: Vec4, environment: Vec3): Vec3 {
 		const p = this.#float;
 		const v4 = this.#vec4;
 		// lil_common_frag.hlsl:1069-1099: a slot without a texture is 0, as without LIL_FEATURE_ShadowColorTex.
@@ -488,13 +535,10 @@ export class LilToonLightingModel extends LightingModel {
 			this.#host.hasTexture(name)
 				? this.#texture(name).sample(this.#uvMain())
 				: vec4(0);
-		const bands = this.#normalizedBands();
 		return tslShade({
 			albedo,
 			light,
-			// fd.indLightColor = saturate(shMin) (lil_common_functions.hlsl:1022): the ambient before the light limit,
-			// read by `_ShadowEnvStrength` only (lil_common_frag.hlsl:1125).
-			environment: saturate(this.#ambient),
+			environment,
 			bands,
 			// lil_common_frag.hlsl:1049 and 1064 (`_ShadowMaskType` 0).
 			shadowStrength: p("_ShadowStrength").mul(

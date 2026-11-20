@@ -127,7 +127,7 @@ describe("LilToonNodeMaterial shading features", () => {
 			"lilLight",
 			"lilLightWeight",
 			"lilBacklight",
-			"lilLight",
+			"lilAddedLight",
 			"lilAmbient",
 			"outgoingLight",
 		]);

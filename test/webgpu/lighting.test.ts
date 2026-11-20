@@ -6,6 +6,7 @@ import { LilToonLightingModel } from "../../src/webgpu/LilToonLightingModel";
 import { LilToonNodeMaterial } from "../../src/webgpu/LilToonNodeMaterial";
 import {
 	limitClampsIn,
+	collect,
 	contains,
 	getShadowOf,
 	runModel,
@@ -85,7 +86,7 @@ describe("LilToonLightingModel", () => {
 			"lilLight",
 			"lilLightWeight",
 			"lilBands",
-			"lilLight",
+			"lilAddedLight",
 			"lilAmbient",
 			"outgoingLight",
 		]);
@@ -100,13 +101,13 @@ describe("LilToonLightingModel", () => {
 			light: { isDirectionalLight: true },
 		};
 		const { assigned } = runModel(material, [point, sun, point]);
-		// Unity lilToon shades the main light with the bands and adds the other lights to the light color only.
+		// Unity lilToon shades the main light in the base pass and each other light in a ForwardAdd pass.
 		expect(assigned).toEqual([
-			"lilLight",
+			"lilAddedLight",
 			"lilLight",
 			"lilLightWeight",
 			"lilBands",
-			"lilLight",
+			"lilAddedLight",
 			"lilAmbient",
 			"outgoingLight",
 		]);
@@ -114,19 +115,23 @@ describe("LilToonLightingModel", () => {
 
 	it("shades the first light when the set has no directional light", () => {
 		const material = new LilToonNodeMaterial({ properties: { _UseShadow: 1 } });
-		const spot = (): Light => ({ shadowNode: null, baseColorNode: null, light: {} });
+		const spot = (): Light => ({
+			shadowNode: null,
+			baseColorNode: null,
+			light: {},
+		});
 		const { assigned } = runModel(material, [spot(), spot()]);
 		expect(assigned).toEqual([
 			"lilLight",
 			"lilLightWeight",
 			"lilBands",
-			"lilLight",
+			"lilAddedLight",
 			"lilAmbient",
 			"outgoingLight",
 		]);
 	});
 
-	it("adds another light with its received shadow and no bands", () => {
+	it("adds another light with its own light limit, without bands or the ambient", () => {
 		const seen: Node[] = [];
 		class Sub extends LilToonNodeMaterial {
 			protected override receivedShadow(shadow: Node<"float">): Node<"float"> {
@@ -134,16 +139,64 @@ describe("LilToonLightingModel", () => {
 				return shadow;
 			}
 		}
-		const material = new Sub({ properties: { _UseShadow: 1, _ShadowReceive: 1 } });
+		const material = new Sub({
+			properties: { _UseShadow: 1, _ShadowReceive: 1 },
+		});
 		const main: Light = { shadowNode: null, baseColorNode: null };
 		const shadowed: Light = { shadowNode: float(0.3), baseColorNode: vec3(1) };
 		getShadowOf(material)(shadowed);
-		const { sourcesOf } = runModel(material, [main, shadowed]);
+		const { sourcesOf, entries, outgoing } = runModel(material, [
+			main,
+			shadowed,
+		]);
 		expect(seen).toEqual([shadowed.shadowNode]);
-		const added = sourcesOf("lilLight");
-		expect(added).toHaveLength(2);
-		expect(contains(added[1], shadowed.shadowNode!)).toBe(true);
+		// LIL_PASS_FORWARDADD: min(color × attenuation, _LightMaxLimit) for this light only. One band set keeps the
+		// program of a light set quick to build, so the light adds albedo × light.
+		expect(sourcesOf("lilLight")).toHaveLength(1);
 		expect(sourcesOf("lilBands")).toHaveLength(1);
+		const [added] = sourcesOf("lilAddedLight");
+		expect(contains(added, shadowed.shadowNode!)).toBe(true);
+		expect(
+			contains(added, material.propertyNode("_ShadowBorder", "float")),
+		).toBe(false);
+		expect(
+			contains(added, material.propertyNode("_LightMaxLimit", "float")),
+		).toBe(true);
+		expect(contains(added, variable(entries, "lilAmbient"))).toBe(false);
+		expect(contains(added, variable(entries, "lilLight"))).toBe(false);
+		expect(contains(outgoing, variable(entries, "lilAddedLight"))).toBe(true);
+	});
+
+	it("applies the received shadow after the band step when a subclass asks for it", () => {
+		class AfterBands extends LilToonNodeMaterial {
+			protected override receivedShadowAfterBands(): boolean {
+				return true;
+			}
+		}
+		const properties = { _UseShadow: 1, _ShadowReceive: 1 };
+		// The anti-aliasing term of a band is fwidth of its half Lambert value: lilToon multiplies the shadow into that value.
+		const shadowInBandStep = (material: LilToonNodeMaterial) => {
+			const shadowed: Light = {
+				shadowNode: float(0.3),
+				baseColorNode: vec3(1),
+			};
+			getShadowOf(material)(shadowed);
+			const [bands] = runModel(material, [shadowed]).sourcesOf("lilBands");
+			expect(contains(bands, shadowed.shadowNode!)).toBe(true);
+			return collect(
+				bands,
+				(node) => (node as { method?: string }).method === "fwidth",
+			).some((node) => contains(node, shadowed.shadowNode!));
+		};
+		expect(shadowInBandStep(new LilToonNodeMaterial({ properties }))).toBe(
+			true,
+		);
+		const after = new AfterBands({ properties });
+		expect(shadowInBandStep(after)).toBe(false);
+		expect(after.customProgramCacheKey()).toContain("shadowAfterBands");
+		expect(
+			new LilToonNodeMaterial({ properties }).customProgramCacheKey(),
+		).not.toContain("shadowAfterBands");
 	});
 
 	it("passes the context irradiance to the roomIrradiance hook of a subclass", () => {

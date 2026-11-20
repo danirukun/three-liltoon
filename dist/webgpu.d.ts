@@ -118,6 +118,12 @@ declare class LilToonNodeMaterial extends NodeMaterial {
      */
     protected receivedShadow(shadow: Node<"float">): Node<"float">;
     /**
+     * `true` applies the received shadow after the bands, as MToon does: the bands take the lit value, and each band is
+     * then multiplied by `lerp(1, shadow, _ShadowReceive)` of its band. `false` (lilToon) multiplies the shadow into the
+     * half Lambert value before the bands (lil_common_frag.hlsl:975-979). A subclass overrides it.
+     */
+    protected receivedShadowAfterBands(): boolean;
+    /**
      * The irradiance of the ambient term. `irradiance` is the scene ambient (ambient, hemisphere, and probe lights);
      * `iblIrradiance` is what `setupEnvironment()` adds. `null` uses `irradiance`. A subclass overrides it.
      */
@@ -174,6 +180,8 @@ interface LilToonLightingHost {
     features: ReadonlySet<keyof LilToonFeatureSet>;
     hasTexture(name: string): boolean;
     receivedShadow(shadow: Float$1): Float$1;
+    /** The received shadow multiplies the bands after the band step (MToon) instead of the half Lambert value (lilToon). */
+    shadowAfterBands: boolean;
     roomIrradiance(irradiance: Vec3$1, iblIrradiance: Vec3$1): Vec3$1 | null;
     /** The material is the outline of generateLilToonOutlines. It draws the outline color only. */
     outline: boolean;
@@ -185,15 +193,16 @@ interface LilToonLightingHost {
 /**
  * The lilToon lighting of LilToonNodeMaterial.
  *
- * Unity lilToon shades one main light (the directional light plus the SH ambient) with the bands and adds the other
- * lights to the light color. This model does the same. The main light is the first directional light of the build,
- * else the first light that reaches `direct()`. `direct()` adds the light color × UNITY_LIGHT_SCALE of each light to a
- * summed light (another light with its received shadow), and for the main light its bands and backlight factor ×
- * lilGray(light color). `indirect()` keeps the ambient (the scene irradiance, or what the roomIrradiance hook returns,
- * over π). `finish()` divides the bands by the weight, adds the ambient to the summed light, limits that light color
- * once, and shades it, as lilGetShading shades the main light. With one light this is the Unity result.
+ * Unity lilToon (built-in pipeline) shades one main light (the directional light plus the SH ambient) in the base pass,
+ * and each other per-pixel light in a ForwardAdd pass that adds its color. This model does the same in one pass. The
+ * main light is the first directional light of the build, else the first light that reaches `direct()`. `direct()`
+ * keeps the light color × UNITY_LIGHT_SCALE of the main light with its bands and backlight factor × lilGray(light
+ * color), and adds the ForwardAdd color of each other light: its own light limit, no bands, and no ambient.
+ * `indirect()` keeps the ambient (the scene irradiance, or what the roomIrradiance hook returns, over π). `finish()`
+ * divides the bands by the weight, adds the ambient to the main light, limits that light color once, shades it as
+ * lilGetShading shades the main light, and adds the ForwardAdd colors.
  * Rim light, matcap, and emission do not depend on the light direction; `finish()` applies them once to the shaded
- * color, with the summed light, as lilToon does.
+ * color of the main light, as the base pass does. The ForwardAdd terms of these effects are not ported.
  */
 declare class LilToonLightingModel extends LightingModel {
     #private;

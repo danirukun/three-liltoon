@@ -1,6 +1,6 @@
 import { BackSide, FrontSide, DoubleSide, Vector2, Vector3, Vector4, SRGBColorSpace, LinearSRGBColorSpace, RepeatWrapping, BufferAttribute, DataTexture, RGBAFormat, UnsignedByteType, LinearFilter } from 'three';
 import { LightingModel, NodeMaterial, NodeUpdateType, TextureNode } from 'three/webgpu';
-import { positionLocal, uv, select, max, mix, pow, saturate as saturate$1, dot, positionViewDirection, normalize, float, abs, sqrt, modelWorldMatrix, vec4, length, cameraPosition, normalLocal, vec3, normalView, normalViewGeometry, frontFacing, diffuseColor, vec2, dFdx, dFdy, context, normalMap, fwidth, faceDirection, cameraProjectionMatrix, cameraViewMatrix, cross, sin, time, round, min, uniform, clamp } from 'three/tsl';
+import { positionLocal, uv, select, max, mix, pow, saturate as saturate$1, dot, positionViewDirection, normalize, float, abs, sqrt, modelWorldMatrix, vec4, length, cameraPosition, normalLocal, vec3, normalView, normalViewGeometry, diffuseColor, min, frontFacing, vec2, dFdx, dFdy, context, normalMap, fwidth, faceDirection, cameraProjectionMatrix, cameraViewMatrix, cross, sin, time, round, uniform, clamp } from 'three/tsl';
 
 // src/webgpu/LilToonNodeMaterial.ts
 
@@ -1732,6 +1732,7 @@ var LilToonLightingModel = class extends LightingModel {
   material;
   #host;
   #light = vec3();
+  #added = vec3();
   #weight = float();
   #bands = vec4();
   #ambient = vec3();
@@ -1761,6 +1762,7 @@ var LilToonLightingModel = class extends LightingModel {
       (node) => node.light?.isDirectionalLight === true
     ) ?? null;
     this.#light = vec3().toVar("lilLight");
+    this.#added = vec3().toVar("lilAddedLight");
     this.#weight = float().toVar("lilLightWeight");
     this.#bands = vec4(0, 0, 0, 0).toVar("lilBands");
     this.#ambient = vec3().toVar("lilAmbient");
@@ -1780,18 +1782,16 @@ var LilToonLightingModel = class extends LightingModel {
     const color = lightColor.mul(UNITY_LIGHT_SCALE);
     const lightNode = input.lightNode;
     const shadowNode = host.shadowed.has(lightNode) ? lightNode.shadowNode : null;
+    const shadow = shadowNode ? host.receivedShadow(shadowNode) : float(1);
     this.#main ??= lightNode;
     if (lightNode !== this.#main) {
-      this.#light.addAssign(
-        shadowNode ? color.mul(host.receivedShadow(shadowNode)) : color
-      );
+      this.#added.addAssign(this.#addedLight(color.mul(shadow)));
       return;
     }
     this.#light.addAssign(color);
     const shadowOn = host.features.has("shadow");
     const backlightOn = host.features.has("backlight");
     if (!shadowOn && !backlightOn) return;
-    const shadow = shadowNode ? host.receivedShadow(shadowNode) : float(1);
     const weight = tslGray(color);
     this.#weight.addAssign(weight);
     if (shadowOn)
@@ -1808,14 +1808,33 @@ var LilToonLightingModel = class extends LightingModel {
         }).mul(weight)
       );
   }
+  /**
+   * The color that the ForwardAdd pass adds for another light, with the light limit of LIL_GET_MAINLIGHT in
+   * LIL_PASS_FORWARDADD (lil_common_macro.hlsl:2146-2150): min(color × attenuation, `_LightMaxLimit`), with no lower
+   * limit, and no light with `_AsUnlit`. Unity shades this light with its own bands (lil_pass_forward_normal.hlsl:463-469);
+   * this port adds albedo × light, because a band set for each light makes the program of a light set too slow to build
+   * when a light comes or goes. The outline pass adds albedo × light × `_OutlineEnableLighting` (253).
+   */
+  #addedLight(attenuated) {
+    const p = this.#float;
+    const albedo = diffuseColor.rgb;
+    const limited = min(attenuated, vec3(p("_LightMaxLimit")));
+    const light = mix(
+      mix(limited, vec3(tslGray(limited)), p("_MonochromeLighting")),
+      vec3(0),
+      p("_AsUnlit")
+    );
+    return this.#host.outline ? albedo.mul(light).mul(p("_OutlineEnableLighting")) : albedo.mul(light);
+  }
   /** The shadow bands of one light, lil_common_frag.hlsl:920-1044. */
   #lightBands(lightDirection, shadow) {
     const p = this.#float;
     const v4 = this.#vec4;
     const third = this.#host.features.has("shadow3rd");
+    const after = this.#host.shadowAfterBands;
     const plain = tslHalfLambert(this.#normalN.dot(lightDirection));
     const ln = (strength) => this.#geometryNormal ? tslHalfLambert(this.#normal(strength).dot(lightDirection)) : plain;
-    const receive = (strength, name) => tslReceive(ln(strength), shadow, p(name));
+    const receive = (strength, name) => after ? ln(strength) : tslReceive(ln(strength), shadow, p(name));
     const bands = tslShadowBands({
       ln: [
         receive("_ShadowNormalStrength", "_ShadowReceive"),
@@ -1844,7 +1863,17 @@ var LilToonLightingModel = class extends LightingModel {
       float(1),
       float(1).sub(p("_BackfaceForceShadow"))
     );
-    return bands.mul(facing);
+    if (!after) return bands.mul(facing);
+    const received = (name) => mix(float(1), saturate$1(shadow), p(name));
+    const first = received("_ShadowReceive");
+    return bands.mul(
+      vec4(
+        first,
+        received("_Shadow2ndReceive"),
+        third ? received("_Shadow3rdReceive") : float(1),
+        first
+      )
+    ).mul(facing);
   }
   indirect(builder) {
     const { irradiance, iblIrradiance } = builder.context;
@@ -1872,11 +1901,20 @@ var LilToonLightingModel = class extends LightingModel {
     const { outgoingLight } = builder.context;
     if (host.outline) {
       outgoingLight.addAssign(
-        tslOutlineLight(albedo, lightColor, p("_OutlineEnableLighting"))
+        tslOutlineLight(albedo, lightColor, p("_OutlineEnableLighting")).add(
+          this.#added
+        )
       );
       return;
     }
-    let col = features.has("shadow") ? this.#shade(albedo, lightColor) : albedo.mul(lightColor);
+    let col = features.has("shadow") ? this.#shade(
+      albedo,
+      lightColor,
+      this.#normalizedBands(),
+      // fd.indLightColor = saturate(shMin) (lil_common_functions.hlsl:1022): the ambient before the light
+      // limit, read by `_ShadowEnvStrength` only (lil_common_frag.hlsl:1125).
+      saturate$1(this.#ambient)
+    ) : albedo.mul(lightColor);
     const surface = {
       inputs: this.#inputs,
       albedo,
@@ -1893,7 +1931,7 @@ var LilToonLightingModel = class extends LightingModel {
     if (features.has("matcap")) col = tslMatCap(col, surface);
     if (features.has("rim")) col = tslRim(col, surface);
     if (features.has("emission1st")) col = tslEmission(col, surface);
-    outgoingLight.addAssign(col);
+    outgoingLight.addAssign(col.add(this.#added));
   }
   /** The band sum over the weight. A scene without a direct light is lit. */
   #normalizedBands() {
@@ -1919,17 +1957,15 @@ var LilToonLightingModel = class extends LightingModel {
       this.#float(strength)
     );
   }
-  #shade(albedo, light) {
+  /** lilGetShading for one light color, its bands, and the environment light of `_ShadowEnvStrength`. */
+  #shade(albedo, light, bands, environment) {
     const p = this.#float;
     const v4 = this.#vec4;
     const color = (name) => this.#host.hasTexture(name) ? this.#texture(name).sample(this.#uvMain()) : vec4(0);
-    const bands = this.#normalizedBands();
     return tslShade({
       albedo,
       light,
-      // fd.indLightColor = saturate(shMin) (lil_common_functions.hlsl:1022): the ambient before the light limit,
-      // read by `_ShadowEnvStrength` only (lil_common_frag.hlsl:1125).
-      environment: saturate$1(this.#ambient),
+      environment,
       bands,
       // lil_common_frag.hlsl:1049 and 1064 (`_ShadowMaskType` 0).
       shadowStrength: p("_ShadowStrength").mul(
@@ -2413,6 +2449,14 @@ var LilToonNodeMaterial = class _LilToonNodeMaterial extends NodeMaterial {
     return shadow;
   }
   /**
+   * `true` applies the received shadow after the bands, as MToon does: the bands take the lit value, and each band is
+   * then multiplied by `lerp(1, shadow, _ShadowReceive)` of its band. `false` (lilToon) multiplies the shadow into the
+   * half Lambert value before the bands (lil_common_frag.hlsl:975-979). A subclass overrides it.
+   */
+  receivedShadowAfterBands() {
+    return false;
+  }
+  /**
    * The irradiance of the ambient term. `irradiance` is the scene ambient (ambient, hemisphere, and probe lights);
    * `iblIrradiance` is what `setupEnvironment()` adds. `null` uses `irradiance`. A subclass overrides it.
    */
@@ -2580,6 +2624,7 @@ var LilToonNodeMaterial = class _LilToonNodeMaterial extends NodeMaterial {
       features: new Set(outline ? [] : this.#features()),
       hasTexture: (name) => textures[name] != null,
       receivedShadow: (shadow) => this.receivedShadow(shadow),
+      shadowAfterBands: this.receivedShadowAfterBands(),
       roomIrradiance: (irradiance, iblIrradiance) => this.roomIrradiance(irradiance, iblIrradiance),
       outline,
       transparent: this.#mode === "transparent",
@@ -2663,7 +2708,8 @@ var LilToonNodeMaterial = class _LilToonNodeMaterial extends NodeMaterial {
     const features = this.#features();
     const present = Object.keys(this.#textures).filter((name) => this.#textures[name] != null).sort().map((name) => `${name}{${textureKey(this.#textures[name])}}`);
     const pass = this.isOutline ? "|outline" : "";
-    return `${this.#variant}|${features.join(",")}|${present.join(",")}${pass}`;
+    const shadow = this.receivedShadowAfterBands() ? "|shadowAfterBands" : "";
+    return `${this.#variant}|${features.join(",")}|${present.join(",")}${pass}${shadow}`;
   }
   #applyAlphaMode() {
     const cutoff = this.#properties._Cutoff;
