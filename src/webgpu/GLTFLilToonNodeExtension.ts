@@ -88,7 +88,8 @@ export class GLTFLilToonNodeExtension implements GLTFLoaderPlugin {
 		readonly parser: GLTFParser,
 		readonly options: GLTFLilToonNodeExtensionOptions = {},
 	) {
-		const materials = (parser.json?.materials ?? []) as {
+		const list: unknown = parser.json?.materials;
+		const materials = (Array.isArray(list) ? list : []) as {
 			name?: string;
 			extensions?: Record<string, unknown>;
 		}[];
@@ -100,19 +101,23 @@ export class GLTFLilToonNodeExtension implements GLTFLoaderPlugin {
 		this.#names = materials.map((material) => material?.name ?? "");
 	}
 
-	/** The material has the extension. */
+	/** The material has the extension. An index from untrusted JSON that is not an integer, such as "length", has none. */
 	isLilToonMaterial(materialIndex: number): boolean {
-		return this.#definitions[materialIndex] !== undefined;
+		return this.definition(materialIndex) !== undefined;
 	}
 
 	/** The extension of the material as the file had it, or undefined. */
 	definition(materialIndex: number): GLTFLilToonMaterialDefinition | undefined {
-		return this.#definitions[materialIndex];
+		return Number.isInteger(materialIndex)
+			? this.#definitions[materialIndex]
+			: undefined;
 	}
 
 	/** The glTF name of the material. */
 	materialName(materialIndex: number): string {
-		return this.#names[materialIndex] ?? "";
+		return (
+			(Number.isInteger(materialIndex) && this.#names[materialIndex]) || ""
+		);
 	}
 
 	/** Add a warning for a lilToon material. afterRoot publishes it with the material warnings. */
@@ -128,7 +133,7 @@ export class GLTFLilToonNodeExtension implements GLTFLoaderPlugin {
 			code,
 			materialName: this.materialName(materialIndex),
 			materialIndex,
-			shaderKey: this.#definitions[materialIndex]?.shaderVariant ?? "lilToon",
+			shaderKey: this.definition(materialIndex)?.shaderVariant ?? "lilToon",
 			property,
 			message,
 		});

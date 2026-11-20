@@ -13,6 +13,12 @@ import type { RenderOrderAnchor } from "./renderOrder.js";
 
 type Json = Record<string, any>;
 
+// Untrusted file JSON: a list is read only when it is an array, and an entry only when it is an object.
+const isObject = (value: unknown): value is Json =>
+	value !== null && typeof value === "object";
+const objects = (value: unknown): Json[] =>
+	Array.isArray(value) ? value.filter(isObject) : [];
+
 const MTOON_EXTENSION = "VRMC_materials_mtoon";
 const NO_BINDS =
 	"The WebGPU lilToon material does not apply expression material binds. The expression does not change this material.";
@@ -28,10 +34,10 @@ function keepLilToonFromMToon(
 	json: Json,
 	materials: GLTFLilToonNodeExtension,
 ): void {
-	const list = json.materials as Json[] | undefined;
-	list?.forEach((material, index) => {
+	const list = Array.isArray(json.materials) ? (json.materials as Json[]) : [];
+	list.forEach((material, index) => {
 		const definition = materials.definition(index);
-		if (!material || !definition) return;
+		if (!isObject(material) || !definition) return;
 		const { [MTOON_EXTENSION]: _mtoon, ...extensions } = (material.extensions ??
 			{}) as Json;
 		list[index] = {
@@ -51,7 +57,8 @@ function keepLilToonFromMToon(
  */
 function mtoonAnchors(gltf: GLTF, parser: GLTFParser): RenderOrderAnchor[] {
 	const json = parser.json as Json;
-	const v0 = json.extensions?.VRM?.materialProperties as Json[] | undefined;
+	const properties: unknown = json.extensions?.VRM?.materialProperties;
+	const v0 = Array.isArray(properties) ? (properties as unknown[]) : undefined;
 	const anchors: RenderOrderAnchor[] = [];
 	const roots = gltf.scenes?.length ? gltf.scenes : [gltf.scene];
 	for (const root of roots)
@@ -64,12 +71,13 @@ function mtoonAnchors(gltf: GLTF, parser: GLTFParser): RenderOrderAnchor[] {
 			if (!surface?.transparent) return;
 			const index = parser.associations.get(surface)?.materials;
 			if (index === undefined) return;
-			const mtoon = json.materials?.[index]?.extensions?.[MTOON_EXTENSION] as
-				Json | undefined;
-			if (!mtoon) return;
+			const mtoon: unknown =
+				json.materials?.[index]?.extensions?.[MTOON_EXTENSION];
+			if (!isObject(mtoon)) return;
 			const offset = Number(mtoon.renderQueueOffsetNumber ?? 0);
+			const entry = v0?.[index];
 			const queue =
-				v0?.[index]?.renderQueue ??
+				(isObject(entry) ? entry.renderQueue : undefined) ??
 				(mtoon.transparentWithZWrite ? 2501 : 3000) + offset;
 			anchors.push({ queue: Number(queue), renderOrder: mesh.renderOrder });
 		});
@@ -78,11 +86,12 @@ function mtoonAnchors(gltf: GLTF, parser: GLTFParser): RenderOrderAnchor[] {
 
 /** VRM 0 blendShapeGroups[].materialValues bind a material by name; three-vrm also matches the "(Outline)" name. */
 function warnV0Binds(json: Json, materials: GLTFLilToonNodeExtension): void {
-	const groups = (json.extensions?.VRM?.blendShapeMaster?.blendShapeGroups ??
-		[]) as Json[];
-	const count = (json.materials as unknown[] | undefined)?.length ?? 0;
+	const groups = objects(
+		json.extensions?.VRM?.blendShapeMaster?.blendShapeGroups,
+	);
+	const count = Array.isArray(json.materials) ? json.materials.length : 0;
 	for (const group of groups)
-		for (const value of (group.materialValues ?? []) as Json[])
+		for (const value of objects(group.materialValues))
 			for (let index = 0; index < count; index++) {
 				if (!materials.isLilToonMaterial(index)) continue;
 				const name = materials.materialName(index);
@@ -100,17 +109,19 @@ function warnV0Binds(json: Json, materials: GLTFLilToonNodeExtension): void {
 			}
 }
 
-/** VRM 1 expressions bind a material by index. */
+/** VRM 1 expressions bind a material by index. An index that is not an integer, such as "length", binds nothing. */
 function warnV1Binds(json: Json, materials: GLTFLilToonNodeExtension): void {
-	const expressions = json.extensions?.VRMC_vrm?.expressions as
-		Json | undefined;
+	const expressions: unknown = json.extensions?.VRMC_vrm?.expressions;
+	if (!isObject(expressions)) return;
 	const entries = [
-		...Object.entries((expressions?.preset ?? {}) as Json),
-		...Object.entries((expressions?.custom ?? {}) as Json),
+		...Object.entries(isObject(expressions.preset) ? expressions.preset : {}),
+		...Object.entries(isObject(expressions.custom) ? expressions.custom : {}),
 	];
 	for (const [name, expression] of entries)
 		for (const kind of ["materialColorBinds", "textureTransformBinds"])
-			for (const bind of (expression?.[kind] ?? []) as Json[]) {
+			for (const bind of objects(
+				isObject(expression) ? expression[kind] : undefined,
+			)) {
 				if (!materials.isLilToonMaterial(bind.material)) continue;
 				const what =
 					kind === "materialColorBinds"

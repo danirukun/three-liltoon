@@ -47,11 +47,11 @@ import {
 } from "./lilToonShading.js";
 import {
 	LILTOON_NODE_FEATURES,
+	checkNodeValue,
 	enabledNodeFeatures,
 	nodeProperties,
 	nodeVariant,
 	nodeWarnings,
-	normalizeNodeValue,
 	type LilToonNodeMode,
 	type LilToonNodeValue,
 	type LilToonScalarOrVector,
@@ -115,6 +115,8 @@ export class LilToonNodeMaterial extends NodeMaterial {
 	#mode: LilToonNodeMode = "opaque";
 	#requestedShader: string | undefined;
 	#properties: Record<string, LilToonNodeValue> = {};
+	/** The message of each property whose last given value had a wrong shape. getWarnings reports them. */
+	#invalid = new Map<string, string>();
 	#textures: Record<string, Texture | null> = {};
 	#propertyNodes = new Map<string, PropertyNodes[PropertyType]>();
 	#textureNodes = new Map<string, TextureNode>();
@@ -128,6 +130,7 @@ export class LilToonNodeMaterial extends NodeMaterial {
 		this.#properties = nodeProperties(
 			this.#variant,
 			parameters.properties ?? {},
+			(name, message) => this.#invalid.set(name, message),
 		);
 		for (const [name, value] of Object.entries(parameters.textures ?? {}))
 			this.#assignTexture(name, value);
@@ -197,9 +200,16 @@ export class LilToonNodeMaterial extends NodeMaterial {
 		return null;
 	}
 
+	/** Set one property. A value of a wrong shape is ignored, and getWarnings names it until a value fits. */
 	setProperty(name: string, value: LilToonScalarOrVector): void {
+		const checked = checkNodeValue(name, value, this.#properties[name]);
+		if (checked.message !== undefined) {
+			this.#invalid.set(name, checked.message);
+			return;
+		}
+		this.#invalid.delete(name);
 		const before = this.#programKey();
-		const next = normalizeNodeValue(value, this.#properties[name]);
+		const next = checked.value;
 		this.#properties[name] = next;
 		this.#syncNode(name, next);
 		if (name === "_Cutoff") this.#applyAlphaMode();
@@ -249,13 +259,28 @@ export class LilToonNodeMaterial extends NodeMaterial {
 		return node;
 	}
 
+	/** The compatibility warnings: first each property value of a wrong shape, then the feature warnings. */
 	getWarnings(): LilToonWarning[] {
-		return nodeWarnings(
-			this.name,
-			this.#properties,
-			this.#textures,
-			this.#requestedShader,
+		const shaderKey = this.#requestedShader ?? this.#variant;
+		const invalid: LilToonWarning[] = [...this.#invalid].map(
+			([property, message]) => ({
+				severity: "warning",
+				code: "invalid-property-value",
+				materialName: this.name,
+				shaderKey,
+				property,
+				message,
+			}),
 		);
+		return [
+			...invalid,
+			...nodeWarnings(
+				this.name,
+				this.#properties,
+				this.#textures,
+				this.#requestedShader,
+			),
+		];
 	}
 
 	override customProgramCacheKey(): string {
@@ -275,6 +300,7 @@ export class LilToonNodeMaterial extends NodeMaterial {
 				copyValue(value),
 			]),
 		);
+		this.#invalid = new Map(source.#invalid);
 		this.#textures = { ...source.#textures };
 		this.#propertyNodes.clear();
 		this.#textureNodes.clear();

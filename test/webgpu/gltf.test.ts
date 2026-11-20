@@ -2,6 +2,7 @@ import {
 	BufferAttribute,
 	BufferGeometry,
 	DataTexture,
+	Group,
 	Matrix3,
 	Mesh,
 	MeshStandardMaterial,
@@ -25,6 +26,7 @@ import {
 	lilToonRenderOrder,
 	type LilToonNodeWarning as LilToonWarning,
 } from "../../src/webgpu";
+import { LILTOON_DEFAULTS } from "../../src/generated/defaults";
 import { ensureLilToonNodeTangents } from "../../src/webgpu/tangents";
 import { getNeutralTexture } from "../../src/utils/texture";
 
@@ -244,6 +246,46 @@ describe("GLTFLilToonNodeExtension", () => {
 		expect(gltf.parser.associations.get(body!)).toMatchObject({ materials: 0 });
 		expect(pbr).toBeInstanceOf(MeshStandardMaterial);
 		expect(pbr).not.toBeInstanceOf(LilToonNodeMaterial);
+	});
+
+	it("loads a material with wrong property shapes with the defaults and one warning per property", async () => {
+		// Untrusted avatar JSON must never fail the load: each wrong shape keeps the default of the property.
+		const { gltf, warnings } = await load(
+			documentWith([
+				lilToon("Bad", {
+					properties: {
+						_UseShadow: 1,
+						_Color: null,
+						_ShadowColor: "red",
+						_RimColor: { r: 1 },
+						_Shadow2ndColor: [1, 0, 0, 1, 1],
+						_ShadowBorder: [0.5],
+						_Shadow3rdColor: 0.5,
+					},
+				}),
+			]),
+		);
+		const material = surface(meshes(gltf)[0]!) as LilToonNodeMaterial;
+		expect(material).toBeInstanceOf(LilToonNodeMaterial);
+		expect(material.getProperty("_UseShadow")).toBe(1);
+		expect(material.getProperty("_Color")).toEqual(LILTOON_DEFAULTS._Color);
+		expect(material.getProperty("_ShadowColor")).toEqual(
+			LILTOON_DEFAULTS._ShadowColor,
+		);
+		expect(material.getProperty("_ShadowBorder")).toBe(
+			LILTOON_DEFAULTS._ShadowBorder,
+		);
+		expect(warnings.map((w) => [w.code, w.materialIndex, w.property])).toEqual(
+			[
+				"_Color",
+				"_ShadowColor",
+				"_RimColor",
+				"_Shadow2ndColor",
+				"_ShadowBorder",
+				"_Shadow3rdColor",
+			].map((property) => ["invalid-property-value", 0, property]),
+		);
+		expect(gltf.userData.lilToonWarnings).toEqual(warnings);
 	});
 
 	it("constructs the material type of the options", async () => {
@@ -881,6 +923,160 @@ describe("enableLilToonNodeVRM", () => {
 			["Body", 0, "textureTransformBinds"],
 		]);
 		expect(gltf.userData.lilToonWarnings).toEqual(warnings);
+	});
+
+	it("ignores a VRM 0 materialValues that is not a list and keeps the bind warning of a real list", async () => {
+		// Falsy values in place of the list, which the three-vrm expression plugin also accepts.
+		const json = vrm0();
+		const master = json.extensions.VRM.blendShapeMaster;
+		master.blendShapeGroups = [
+			{ name: "Empty", materialValues: "" },
+			{ name: "Zero", materialValues: 0 },
+			{
+				name: "Real",
+				materialValues: [
+					{
+						materialName: "Body",
+						propertyName: "_Color",
+						targetValue: [1, 0, 0, 1],
+					},
+				],
+			},
+		];
+		const { warnings } = await load(json, registerVRM());
+		expect(
+			warnings.map((w) => [w.materialName, w.property, w.message]),
+		).toEqual([["Body", "_Color", expect.stringContaining("Real")]]);
+	});
+
+	it("ignores a VRM 1 bind whose material is not an integer index", async () => {
+		const json = documentWith([lilToon("Body", {}), { name: "PBR" }]);
+		json.extensionsUsed.push("VRMC_vrm");
+		const bind = (material: unknown) => ({
+			material,
+			type: "color",
+			targetValue: [1, 0, 0, 1],
+		});
+		json.extensions = {
+			VRMC_vrm: {
+				specVersion: "1.0",
+				expressions: {
+					preset: {
+						happy: {
+							materialColorBinds: [
+								bind("length"),
+								bind("__proto__"),
+								bind("0"),
+								bind(1.5),
+								bind(-1),
+								bind(99),
+								bind(0),
+							],
+						},
+						angry: null,
+					},
+					custom: null,
+				},
+			},
+		};
+		const { warnings } = await load(json, registerVRM());
+		expect(
+			warnings.map((w) => [w.materialName, w.materialIndex, w.property]),
+		).toEqual([["Body", 0, "materialColorBinds"]]);
+	});
+
+	it("does not throw in afterRoot on malformed VRM 0 or VRM 1 expression JSON", async () => {
+		// The hook alone, with a fake plugin, for the shapes that the three-vrm plugin itself rejects.
+		const run = async (extensions: Json) => {
+			const parser = {
+				json: { materials: [lilToon("Body", {}), { name: "PBR" }], extensions },
+				associations: new Map(),
+			} as unknown as GLTFParser;
+			const plugin = {
+				parser,
+				beforeRoot: async () => {},
+				afterRoot: async () => {},
+			} as unknown as VRMLoaderPlugin;
+			const warnings: LilToonWarning[] = [];
+			enableLilToonNodeVRM(plugin, { onWarning: (w) => warnings.push(w) });
+			await plugin.afterRoot({
+				scene: new Group(),
+				scenes: [],
+				userData: {},
+			} as unknown as GLTF);
+			return warnings;
+		};
+		const malformed: Json[] = [
+			{ VRM: "none" },
+			{ VRM: { blendShapeMaster: "none" } },
+			{ VRM: { blendShapeMaster: { blendShapeGroups: { name: "Joy" } } } },
+			{
+				VRM: {
+					blendShapeMaster: {
+						blendShapeGroups: [
+							null,
+							7,
+							"Joy",
+							{ materialValues: "Body" },
+							{ materialValues: [null, 3, "Body"] },
+						],
+					},
+				},
+			},
+			{ VRMC_vrm: "none" },
+			{ VRMC_vrm: { expressions: "none" } },
+			{ VRMC_vrm: { expressions: { preset: "none", custom: 7 } } },
+			{
+				VRMC_vrm: {
+					expressions: {
+						preset: {
+							happy: { materialColorBinds: { material: 0 } },
+							angry: null,
+							blink: "x",
+						},
+						custom: { a: { textureTransformBinds: [null, 3, "x"] } },
+					},
+				},
+			},
+		];
+		for (const extensions of malformed)
+			expect(await run(extensions)).toEqual([]);
+		// A real bind in a list with malformed entries still warns once.
+		expect(
+			await run({
+				VRM: {
+					blendShapeMaster: {
+						blendShapeGroups: [
+							null,
+							{ name: "Joy", materialValues: [null, { materialName: "Body" }] },
+						],
+					},
+				},
+			}),
+		).toMatchObject([{ materialIndex: 0, property: "materialValues" }]);
+		expect(
+			await run({
+				VRMC_vrm: {
+					expressions: {
+						custom: { a: { materialColorBinds: [null, { material: 0 }] } },
+					},
+				},
+			}),
+		).toMatchObject([{ materialIndex: 0, property: "materialColorBinds" }]);
+	});
+
+	it("answers false for a material index that is not an integer", () => {
+		const parser = {
+			json: { materials: [lilToon("Body", {}), { name: "PBR" }] },
+			associations: new Map(),
+		} as unknown as GLTFParser;
+		const materials = new GLTFLilToonNodeExtension(parser);
+		expect(materials.isLilToonMaterial(0)).toBe(true);
+		expect(materials.isLilToonMaterial(1)).toBe(false);
+		for (const index of ["length", "__proto__", "0", 0.5, -1, 2, Number.NaN])
+			expect(materials.isLilToonMaterial(index as never)).toBe(false);
+		expect(materials.definition("length" as never)).toBeUndefined();
+		expect(materials.materialName("length" as never)).toBe("");
 	});
 
 	it("enhances a plugin once", () => {

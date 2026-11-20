@@ -144,25 +144,99 @@ export function nodeVariant(name: string | undefined): LilToonNodeVariant {
 	};
 }
 
-const toArray = (value: LilToonScalarOrVector): LilToonNodeValue => {
+const isFiniteNumber = (value: unknown): value is number =>
+	typeof value === "number" && Number.isFinite(value);
+
+/** The value as a number or a number array, or null when it has no shape the node path reads. */
+const toArray = (value: unknown): LilToonNodeValue | null => {
 	if (typeof value === "boolean") return value ? 1 : 0;
-	if (typeof value === "number") return value;
-	if (Array.isArray(value)) return [...value];
-	if ("isColor" in value) return [value.r, value.g, value.b];
-	return value.toArray();
+	if (isFiniteNumber(value)) return value;
+	if (Array.isArray(value))
+		return value.every(isFiniteNumber) ? [...value] : null;
+	if (value === null || typeof value !== "object") return null;
+	if ((value as Color).isColor === true) {
+		const color = value as Color;
+		return [color.r, color.g, color.b];
+	}
+	if (typeof (value as Vector4).toArray !== "function") return null;
+	const array: unknown = (value as Vector4).toArray();
+	return Array.isArray(array) && array.every(isFiniteNumber) ? array : null;
 };
 
-/** Convert to a number or array. A short array keeps the rest of the template. */
+const describeValue = (value: unknown): string => {
+	if (value === null) return "null";
+	if (Array.isArray(value)) return `an array of ${value.length}`;
+	if (typeof value === "string") return `the string "${value}"`;
+	if (typeof value === "number") return `the number ${value}`;
+	if (typeof value === "object") return "an object";
+	return `a ${typeof value}`;
+};
+
+const describeTemplate = (template: LilToonNodeValue): string =>
+	Array.isArray(template)
+		? `a vector of ${template.length} (${template.join(", ")})`
+		: `the number ${template}`;
+
+export type NodeValueCheck =
+	| { value: LilToonNodeValue; message?: undefined }
+	| { value?: undefined; message: string };
+
+/**
+ * The node value of an untrusted property value against the default of the property, or the message that says why the
+ * value does not fit. A boolean is 0 or 1, a Color or a Vector is its components, and a short array keeps the rest of
+ * the default. A value of another type, an array with an entry that is not a finite number, a scalar for a vector,
+ * a vector for a scalar, or an array longer than the default does not fit. A name without a default takes a finite
+ * number or an array of 2 to 4.
+ */
+export function checkNodeValue(
+	name: string,
+	value: unknown,
+	template: LilToonNodeValue | undefined,
+): NodeValueCheck {
+	const result = toArray(value);
+	const given = describeValue(value);
+	if (template === undefined) {
+		if (
+			result !== null &&
+			(!Array.isArray(result) || (result.length >= 2 && result.length <= 4))
+		)
+			return { value: result };
+		return {
+			message: `${name} is ${given}, and a lilToon property is a number or a vector of 2 to 4. The material ignores it.`,
+		};
+	}
+	const fallback = `The material uses the default ${describeTemplate(template)}.`;
+	if (result === null)
+		return {
+			message: `${name} is ${given}, and the property is ${describeTemplate(template)}. ${fallback}`,
+		};
+	if (!Array.isArray(template)) {
+		if (!Array.isArray(result)) return { value: result };
+		return {
+			message: `${name} is ${given}, and the property is a number. ${fallback}`,
+		};
+	}
+	if (!Array.isArray(result) || result.length > template.length)
+		return {
+			message: `${name} is ${given}, and the property is a vector of ${template.length}. ${fallback}`,
+		};
+	for (let i = result.length; i < template.length; i++)
+		result.push(template[i]!);
+	return { value: result };
+}
+
+/** Convert to a number or array. A short array keeps the rest of the template. A value of a wrong shape throws. */
 export function normalizeNodeValue(
 	value: LilToonScalarOrVector,
 	template?: LilToonNodeValue,
 ): LilToonNodeValue {
-	const result = toArray(value);
-	if (Array.isArray(result) && Array.isArray(template))
-		for (let i = result.length; i < template.length; i++)
-			result.push(template[i]!);
-	return result;
+	const checked = checkNodeValue("The value", value, template);
+	if (checked.message !== undefined) throw new TypeError(checked.message);
+	return checked.value;
 }
+
+/** Called once for each property whose value does not fit, with the message of checkNodeValue. */
+export type InvalidNodeValue = (name: string, message: string) => void;
 
 const modeDefaults = (mode: string): Record<string, LilToonNodeValue> => {
 	const defaults: Record<string, LilToonNodeValue> = {};
@@ -178,13 +252,21 @@ const modeDefaults = (mode: string): Record<string, LilToonNodeValue> => {
 	return defaults;
 };
 
+/**
+ * The defaults of the variant with the given values over them. A value of a wrong shape keeps the default and goes to
+ * `onInvalid`, so an untrusted file never fails the load.
+ */
 export function nodeProperties(
 	variant: LilToonShaderVariant,
 	properties: Record<string, LilToonScalarOrVector>,
+	onInvalid?: InvalidNodeValue,
 ): Record<string, LilToonNodeValue> {
 	const result = modeDefaults(shaderVariants[variant][0]);
-	for (const [name, value] of Object.entries(properties))
-		result[name] = normalizeNodeValue(value, result[name]);
+	for (const [name, value] of Object.entries(properties)) {
+		const checked = checkNodeValue(name, value, result[name]);
+		if (checked.message !== undefined) onInvalid?.(name, checked.message);
+		else result[name] = checked.value;
+	}
 	return result;
 }
 

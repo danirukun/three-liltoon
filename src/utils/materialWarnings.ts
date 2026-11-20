@@ -7,7 +7,9 @@ export type LilToonWarningCode =
 	| "texture-type-mismatch"
 	| "spec-version-mismatch"
 	| "unsupported-shader-variant"
-	| "shader-mode-conflict";
+	| "shader-mode-conflict"
+	/** A property value of a wrong type or length. The material uses the default of the property (WebGPU). */
+	| "invalid-property-value";
 
 /** Serializable, non-fatal compatibility diagnostic. */
 export interface LilToonWarning {

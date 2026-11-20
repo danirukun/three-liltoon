@@ -126,13 +126,35 @@ describe("LilToonLightingModel", () => {
 		// vec4() with no value is a Vector4 with w 1. The fourth component is the shadow border band (lns.w), which
 		// lilShade multiplies into _ShadowBorderColor; a start value of 1 lifts the red channel of every pixel.
 		const material = new LilToonNodeMaterial({ properties: { _UseShadow: 1 } });
-		const { entries } = runModel(material, [{ shadowNode: null, baseColorNode: null }]);
-		const bands = entries.find((entry) => entry.targetNode?.name === "lilBands")?.targetNode as
-			| (Node & { node: { value: { x: number; y: number; z: number; w: number } } })
+		const { entries } = runModel(material, [
+			{ shadowNode: null, baseColorNode: null },
+		]);
+		const bands = entries.find((entry) => entry.targetNode?.name === "lilBands")
+			?.targetNode as
+			| (Node & {
+					node: { value: { x: number; y: number; z: number; w: number } };
+			  })
 			| undefined;
 		expect(bands).toBeDefined();
 		const { x, y, z, w } = bands!.node.value;
 		expect([x, y, z, w]).toEqual([0, 0, 0, 0]);
+	});
+
+	it("builds the lighting graph when a lighting property had a wrong shape", () => {
+		// A scalar for a vec4, or a vec4 for a scalar, would throw in propertyNode at node build. The default stands in.
+		const material = new LilToonNodeMaterial({
+			properties: {
+				_UseShadow: 1,
+				_UseRim: 1,
+				_ShadowColor: 0.5,
+				_ShadowBorder: [1, 1, 1, 1],
+				_RimColor: "pink",
+				_LightMaxLimit: null,
+			} as never,
+		});
+		expect(() =>
+			runModel(material, [{ shadowNode: null, baseColorNode: null }]),
+		).not.toThrow();
 	});
 
 	it("only sums the light without _UseShadow", () => {

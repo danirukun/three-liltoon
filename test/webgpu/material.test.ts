@@ -2,6 +2,7 @@ import { LinearSRGBColorSpace, SRGBColorSpace, Texture } from "three";
 import { LightingModel } from "three/webgpu";
 import { float } from "three/tsl";
 import { describe, expect, it } from "vitest";
+import { LILTOON_DEFAULTS } from "../../src/generated/defaults";
 import { getNeutralTexture } from "../../src/utils/texture";
 import { LilToonNodeMaterial } from "../../src/webgpu/LilToonNodeMaterial";
 
@@ -106,6 +107,44 @@ describe("LilToonNodeMaterial properties", () => {
 		const material = new LilToonNodeMaterial({ properties: { _Color: color } });
 		color[0] = 0;
 		expect(material.getProperty("_Color")).toEqual([1, 0, 0, 1]);
+	});
+
+	it("keeps the default and warns for a constructor value with a wrong shape", () => {
+		const material = new LilToonNodeMaterial({
+			properties: {
+				_Color: null,
+				_ShadowBorder: [0.5],
+				_UseShadow: 1,
+			} as never,
+		});
+		expect(material.getProperty("_Color")).toEqual(LILTOON_DEFAULTS._Color);
+		expect(material.getProperty("_ShadowBorder")).toBe(
+			LILTOON_DEFAULTS._ShadowBorder,
+		);
+		expect(material.getWarnings().map((w) => [w.code, w.property])).toEqual([
+			["invalid-property-value", "_Color"],
+			["invalid-property-value", "_ShadowBorder"],
+		]);
+	});
+
+	it("ignores a setProperty value with a wrong shape and keeps the current value", () => {
+		const material = new LilToonNodeMaterial({
+			properties: { _ShadowBorder: 0.3 },
+		});
+		const version = material.version;
+		material.setProperty("_ShadowBorder", [1, 2, 3, 4]);
+		material.setProperty("_Color", "red" as never);
+		expect(material.getProperty("_ShadowBorder")).toBe(0.3);
+		expect(material.getProperty("_Color")).toEqual(LILTOON_DEFAULTS._Color);
+		expect(material.version).toBe(version);
+		expect(material.getWarnings().map((w) => w.property)).toEqual([
+			"_ShadowBorder",
+			"_Color",
+		]);
+		// A later value of the right shape clears the warning of that property.
+		material.setProperty("_ShadowBorder", 0.4);
+		expect(material.getProperty("_ShadowBorder")).toBe(0.4);
+		expect(material.getWarnings().map((w) => w.property)).toEqual(["_Color"]);
 	});
 
 	it("warns about an enabled feature outside the supported set", () => {

@@ -2109,19 +2109,58 @@ function nodeVariant(name) {
     warning: `${name} is not implemented for WebGPU. The material uses lilToon.`
   };
 }
+var isFiniteNumber = (value) => typeof value === "number" && Number.isFinite(value);
 var toArray = (value) => {
   if (typeof value === "boolean") return value ? 1 : 0;
-  if (typeof value === "number") return value;
-  if (Array.isArray(value)) return [...value];
-  if ("isColor" in value) return [value.r, value.g, value.b];
-  return value.toArray();
+  if (isFiniteNumber(value)) return value;
+  if (Array.isArray(value))
+    return value.every(isFiniteNumber) ? [...value] : null;
+  if (value === null || typeof value !== "object") return null;
+  if (value.isColor === true) {
+    const color = value;
+    return [color.r, color.g, color.b];
+  }
+  if (typeof value.toArray !== "function") return null;
+  const array = value.toArray();
+  return Array.isArray(array) && array.every(isFiniteNumber) ? array : null;
 };
-function normalizeNodeValue(value, template) {
+var describeValue = (value) => {
+  if (value === null) return "null";
+  if (Array.isArray(value)) return `an array of ${value.length}`;
+  if (typeof value === "string") return `the string "${value}"`;
+  if (typeof value === "number") return `the number ${value}`;
+  if (typeof value === "object") return "an object";
+  return `a ${typeof value}`;
+};
+var describeTemplate = (template) => Array.isArray(template) ? `a vector of ${template.length} (${template.join(", ")})` : `the number ${template}`;
+function checkNodeValue(name, value, template) {
   const result = toArray(value);
-  if (Array.isArray(result) && Array.isArray(template))
-    for (let i = result.length; i < template.length; i++)
-      result.push(template[i]);
-  return result;
+  const given = describeValue(value);
+  if (template === void 0) {
+    if (result !== null && (!Array.isArray(result) || result.length >= 2 && result.length <= 4))
+      return { value: result };
+    return {
+      message: `${name} is ${given}, and a lilToon property is a number or a vector of 2 to 4. The material ignores it.`
+    };
+  }
+  const fallback = `The material uses the default ${describeTemplate(template)}.`;
+  if (result === null)
+    return {
+      message: `${name} is ${given}, and the property is ${describeTemplate(template)}. ${fallback}`
+    };
+  if (!Array.isArray(template)) {
+    if (!Array.isArray(result)) return { value: result };
+    return {
+      message: `${name} is ${given}, and the property is a number. ${fallback}`
+    };
+  }
+  if (!Array.isArray(result) || result.length > template.length)
+    return {
+      message: `${name} is ${given}, and the property is a vector of ${template.length}. ${fallback}`
+    };
+  for (let i = result.length; i < template.length; i++)
+    result.push(template[i]);
+  return { value: result };
 }
 var modeDefaults = (mode) => {
   const defaults = {};
@@ -2136,10 +2175,13 @@ var modeDefaults = (mode) => {
         defaults[name] = Array.isArray(value) ? [...value] : value;
   return defaults;
 };
-function nodeProperties(variant, properties) {
+function nodeProperties(variant, properties, onInvalid) {
   const result = modeDefaults(shaderVariants[variant][0]);
-  for (const [name, value] of Object.entries(properties))
-    result[name] = normalizeNodeValue(value, result[name]);
+  for (const [name, value] of Object.entries(properties)) {
+    const checked = checkNodeValue(name, value, result[name]);
+    if (checked.message !== void 0) onInvalid?.(name, checked.message);
+    else result[name] = checked.value;
+  }
   return result;
 }
 function enabledNodeFeatures(variant, properties) {
@@ -2244,6 +2286,8 @@ var LilToonNodeMaterial = class extends NodeMaterial {
   #mode = "opaque";
   #requestedShader;
   #properties = {};
+  /** The message of each property whose last given value had a wrong shape. getWarnings reports them. */
+  #invalid = /* @__PURE__ */ new Map();
   #textures = {};
   #propertyNodes = /* @__PURE__ */ new Map();
   #textureNodes = /* @__PURE__ */ new Map();
@@ -2255,7 +2299,8 @@ var LilToonNodeMaterial = class extends NodeMaterial {
     this.#select(parameters.shaderVariant);
     this.#properties = nodeProperties(
       this.#variant,
-      parameters.properties ?? {}
+      parameters.properties ?? {},
+      (name, message) => this.#invalid.set(name, message)
     );
     for (const [name, value] of Object.entries(parameters.textures ?? {}))
       this.#assignTexture(name, value);
@@ -2309,9 +2354,16 @@ var LilToonNodeMaterial = class extends NodeMaterial {
   roomIrradiance(_irradiance, _iblIrradiance) {
     return null;
   }
+  /** Set one property. A value of a wrong shape is ignored, and getWarnings names it until a value fits. */
   setProperty(name, value) {
+    const checked = checkNodeValue(name, value, this.#properties[name]);
+    if (checked.message !== void 0) {
+      this.#invalid.set(name, checked.message);
+      return;
+    }
+    this.#invalid.delete(name);
     const before = this.#programKey();
-    const next = normalizeNodeValue(value, this.#properties[name]);
+    const next = checked.value;
     this.#properties[name] = next;
     this.#syncNode(name, next);
     if (name === "_Cutoff") this.#applyAlphaMode();
@@ -2352,13 +2404,28 @@ var LilToonNodeMaterial = class extends NodeMaterial {
     this.#textureNodes.set(name, node);
     return node;
   }
+  /** The compatibility warnings: first each property value of a wrong shape, then the feature warnings. */
   getWarnings() {
-    return nodeWarnings(
-      this.name,
-      this.#properties,
-      this.#textures,
-      this.#requestedShader
+    const shaderKey = this.#requestedShader ?? this.#variant;
+    const invalid = [...this.#invalid].map(
+      ([property, message]) => ({
+        severity: "warning",
+        code: "invalid-property-value",
+        materialName: this.name,
+        shaderKey,
+        property,
+        message
+      })
     );
+    return [
+      ...invalid,
+      ...nodeWarnings(
+        this.name,
+        this.#properties,
+        this.#textures,
+        this.#requestedShader
+      )
+    ];
   }
   customProgramCacheKey() {
     return `${super.customProgramCacheKey()}|${this.#programKey()}`;
@@ -2376,6 +2443,7 @@ var LilToonNodeMaterial = class extends NodeMaterial {
         copyValue(value)
       ])
     );
+    this.#invalid = new Map(source.#invalid);
     this.#textures = { ...source.#textures };
     this.#propertyNodes.clear();
     this.#textureNodes.clear();
@@ -2734,7 +2802,8 @@ var GLTFLilToonNodeExtension = class {
   constructor(parser, options = {}) {
     this.parser = parser;
     this.options = options;
-    const materials = parser.json?.materials ?? [];
+    const list = parser.json?.materials;
+    const materials = Array.isArray(list) ? list : [];
     this.#definitions = materials.map(
       (material) => material?.extensions?.[this.name]
     );
@@ -2752,17 +2821,17 @@ var GLTFLilToonNodeExtension = class {
   #warnings = /* @__PURE__ */ new Map();
   #tangentIndices = /* @__PURE__ */ new Set();
   #anchors = [];
-  /** The material has the extension. */
+  /** The material has the extension. An index from untrusted JSON that is not an integer, such as "length", has none. */
   isLilToonMaterial(materialIndex) {
-    return this.#definitions[materialIndex] !== void 0;
+    return this.definition(materialIndex) !== void 0;
   }
   /** The extension of the material as the file had it, or undefined. */
   definition(materialIndex) {
-    return this.#definitions[materialIndex];
+    return Number.isInteger(materialIndex) ? this.#definitions[materialIndex] : void 0;
   }
   /** The glTF name of the material. */
   materialName(materialIndex) {
-    return this.#names[materialIndex] ?? "";
+    return Number.isInteger(materialIndex) && this.#names[materialIndex] || "";
   }
   /** Add a warning for a lilToon material. afterRoot publishes it with the material warnings. */
   addWarning(materialIndex, code, property, message) {
@@ -2772,7 +2841,7 @@ var GLTFLilToonNodeExtension = class {
       code,
       materialName: this.materialName(materialIndex),
       materialIndex,
-      shaderKey: this.#definitions[materialIndex]?.shaderVariant ?? "lilToon",
+      shaderKey: this.definition(materialIndex)?.shaderVariant ?? "lilToon",
       property,
       message
     });
@@ -2908,14 +2977,16 @@ var GLTFLilToonNodeExtension = class {
 };
 
 // src/webgpu/vrm.ts
+var isObject = (value) => value !== null && typeof value === "object";
+var objects = (value) => Array.isArray(value) ? value.filter(isObject) : [];
 var MTOON_EXTENSION = "VRMC_materials_mtoon";
 var NO_BINDS = "The WebGPU lilToon material does not apply expression material binds. The expression does not change this material.";
 var enabled2 = /* @__PURE__ */ new WeakSet();
 function keepLilToonFromMToon(json, materials) {
-  const list = json.materials;
-  list?.forEach((material, index) => {
+  const list = Array.isArray(json.materials) ? json.materials : [];
+  list.forEach((material, index) => {
     const definition = materials.definition(index);
-    if (!material || !definition) return;
+    if (!isObject(material) || !definition) return;
     const { [MTOON_EXTENSION]: _mtoon, ...extensions } = material.extensions ?? {};
     list[index] = {
       ...material,
@@ -2925,7 +2996,8 @@ function keepLilToonFromMToon(json, materials) {
 }
 function mtoonAnchors(gltf, parser) {
   const json = parser.json;
-  const v0 = json.extensions?.VRM?.materialProperties;
+  const properties = json.extensions?.VRM?.materialProperties;
+  const v0 = Array.isArray(properties) ? properties : void 0;
   const anchors = [];
   const roots = gltf.scenes?.length ? gltf.scenes : [gltf.scene];
   for (const root of roots)
@@ -2937,18 +3009,21 @@ function mtoonAnchors(gltf, parser) {
       const index = parser.associations.get(surface)?.materials;
       if (index === void 0) return;
       const mtoon = json.materials?.[index]?.extensions?.[MTOON_EXTENSION];
-      if (!mtoon) return;
+      if (!isObject(mtoon)) return;
       const offset = Number(mtoon.renderQueueOffsetNumber ?? 0);
-      const queue = v0?.[index]?.renderQueue ?? (mtoon.transparentWithZWrite ? 2501 : 3e3) + offset;
+      const entry = v0?.[index];
+      const queue = (isObject(entry) ? entry.renderQueue : void 0) ?? (mtoon.transparentWithZWrite ? 2501 : 3e3) + offset;
       anchors.push({ queue: Number(queue), renderOrder: mesh.renderOrder });
     });
   return anchors;
 }
 function warnV0Binds(json, materials) {
-  const groups = json.extensions?.VRM?.blendShapeMaster?.blendShapeGroups ?? [];
-  const count = json.materials?.length ?? 0;
+  const groups = objects(
+    json.extensions?.VRM?.blendShapeMaster?.blendShapeGroups
+  );
+  const count = Array.isArray(json.materials) ? json.materials.length : 0;
   for (const group of groups)
-    for (const value of group.materialValues ?? [])
+    for (const value of objects(group.materialValues))
       for (let index = 0; index < count; index++) {
         if (!materials.isLilToonMaterial(index)) continue;
         const name = materials.materialName(index);
@@ -2964,13 +3039,16 @@ function warnV0Binds(json, materials) {
 }
 function warnV1Binds(json, materials) {
   const expressions = json.extensions?.VRMC_vrm?.expressions;
+  if (!isObject(expressions)) return;
   const entries = [
-    ...Object.entries(expressions?.preset ?? {}),
-    ...Object.entries(expressions?.custom ?? {})
+    ...Object.entries(isObject(expressions.preset) ? expressions.preset : {}),
+    ...Object.entries(isObject(expressions.custom) ? expressions.custom : {})
   ];
   for (const [name, expression] of entries)
     for (const kind of ["materialColorBinds", "textureTransformBinds"])
-      for (const bind of expression?.[kind] ?? []) {
+      for (const bind of objects(
+        isObject(expression) ? expression[kind] : void 0
+      )) {
         if (!materials.isLilToonMaterial(bind.material)) continue;
         const what = kind === "materialColorBinds" ? `the ${String(bind.type)} color` : "the texture transform";
         materials.addWarning(

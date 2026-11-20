@@ -27,7 +27,9 @@ declare const shaderVariants: {
 };
 type LilToonShaderVariant = keyof typeof shaderVariants;
 
-type LilToonWarningCode = "unsupported-feature" | "unused-texture" | "texture-type-mismatch" | "spec-version-mismatch" | "unsupported-shader-variant" | "shader-mode-conflict";
+type LilToonWarningCode = "unsupported-feature" | "unused-texture" | "texture-type-mismatch" | "spec-version-mismatch" | "unsupported-shader-variant" | "shader-mode-conflict"
+/** A property value of a wrong type or length. The material uses the default of the property (WebGPU). */
+ | "invalid-property-value";
 /** Serializable, non-fatal compatibility diagnostic. */
 interface LilToonWarning {
     severity: "warning";
@@ -71,7 +73,13 @@ interface LilToonNodeVariant {
 declare const LILTOON_NODE_FEATURES: ReadonlySet<keyof LilToonFeatureSet>;
 declare const LILTOON_NODE_VARIANTS: ReadonlySet<LilToonShaderVariant>;
 declare function nodeVariant(name: string | undefined): LilToonNodeVariant;
-declare function nodeProperties(variant: LilToonShaderVariant, properties: Record<string, LilToonScalarOrVector>): Record<string, LilToonNodeValue>;
+/** Called once for each property whose value does not fit, with the message of checkNodeValue. */
+type InvalidNodeValue = (name: string, message: string) => void;
+/**
+ * The defaults of the variant with the given values over them. A value of a wrong shape keeps the default and goes to
+ * `onInvalid`, so an untrusted file never fails the load.
+ */
+declare function nodeProperties(variant: LilToonShaderVariant, properties: Record<string, LilToonScalarOrVector>, onInvalid?: InvalidNodeValue): Record<string, LilToonNodeValue>;
 declare function nodeWarnings(name: string, properties: Record<string, LilToonScalarOrVector>, _textures: Record<string, Texture | null>, shaderVariant?: string): LilToonWarning[];
 
 interface LilToonNodeMaterialParameters {
@@ -114,6 +122,7 @@ declare class LilToonNodeMaterial extends NodeMaterial {
      * `iblIrradiance` is what `setupEnvironment()` adds. `null` uses `irradiance`. A subclass overrides it.
      */
     protected roomIrradiance(_irradiance: Node<"vec3">, _iblIrradiance: Node<"vec3">): Node<"vec3"> | null;
+    /** Set one property. A value of a wrong shape is ignored, and getWarnings names it until a value fits. */
     setProperty(name: string, value: LilToonScalarOrVector): void;
     getProperty(name: string): number | number[] | undefined;
     setTexture(name: string, value: Texture | null): void;
@@ -122,6 +131,7 @@ declare class LilToonNodeMaterial extends NodeMaterial {
     propertyNode<T extends PropertyType>(name: string, type: T): PropertyNodes[T];
     /** The texture node that samples one texture slot. Its value follows setTexture. */
     textureNode(name: string): TextureNode;
+    /** The compatibility warnings: first each property value of a wrong shape, then the feature warnings. */
     getWarnings(): LilToonWarning[];
     customProgramCacheKey(): string;
     copy(source: LilToonNodeMaterial): this;
@@ -412,7 +422,7 @@ declare class GLTFLilToonNodeExtension implements GLTFLoaderPlugin {
     readonly options: GLTFLilToonNodeExtensionOptions;
     readonly name = "MOCHIYA_materials_liltoon";
     constructor(parser: GLTFParser, options?: GLTFLilToonNodeExtensionOptions);
-    /** The material has the extension. */
+    /** The material has the extension. An index from untrusted JSON that is not an integer, such as "length", has none. */
     isLilToonMaterial(materialIndex: number): boolean;
     /** The extension of the material as the file had it, or undefined. */
     definition(materialIndex: number): GLTFLilToonMaterialDefinition | undefined;
