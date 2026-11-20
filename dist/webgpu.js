@@ -2567,6 +2567,32 @@ var LILTOON_GLTF_SPEC_VERSION = "1.3";
 function warnLilToon(message) {
   console.warn(`[three-liltoon] ${message}`);
 }
+
+// src/webgpu/renderOrder.ts
+var LILTOON_TRANSPARENT_QUEUE = 3e3;
+function lilToonRenderOrder(queue, anchors = []) {
+  if (anchors.length === 0) return queue - 2981;
+  const equal = anchors.filter((anchor) => anchor.queue === queue);
+  if (equal.length > 0)
+    return Math.max(...equal.map((anchor) => anchor.renderOrder));
+  const below = anchors.filter((anchor) => anchor.queue < queue);
+  const above = anchors.filter((anchor) => anchor.queue > queue);
+  const near = (gap) => 1 / (1 + Math.max(gap, 0));
+  if (below.length > 0) {
+    const low = Math.max(...below.map((anchor) => anchor.renderOrder));
+    const lowQueue = Math.max(...below.map((anchor) => anchor.queue));
+    if (above.length > 0) {
+      const high2 = Math.min(...above.map((anchor) => anchor.renderOrder));
+      const highQueue2 = Math.min(...above.map((anchor) => anchor.queue));
+      if (low < high2)
+        return low + (high2 - low) * (queue - lowQueue) / (highQueue2 - lowQueue);
+    }
+    return low + 1 - near(queue - lowQueue);
+  }
+  const high = Math.min(...above.map((anchor) => anchor.renderOrder));
+  const highQueue = Math.min(...above.map((anchor) => anchor.queue));
+  return high - 1 + near(highQueue - queue);
+}
 function generateIndexedTangents(geometry, mikk) {
   const index = geometry.index;
   const position = geometry.getAttribute("position");
@@ -2725,6 +2751,7 @@ var GLTFLilToonNodeExtension = class {
   #names;
   #warnings = /* @__PURE__ */ new Map();
   #tangentIndices = /* @__PURE__ */ new Set();
+  #anchors = [];
   /** The material has the extension. */
   isLilToonMaterial(materialIndex) {
     return this.#definitions[materialIndex] !== void 0;
@@ -2751,6 +2778,10 @@ var GLTFLilToonNodeExtension = class {
     });
     this.#warnings.set(materialIndex, list);
   }
+  /** The queues and orders of the meshes that another loader ordered. afterRoot puts lilToon meshes between them. */
+  useRenderOrderAnchors(anchors) {
+    this.#anchors = [...anchors];
+  }
   loadMaterial(materialIndex) {
     const definition = this.#definitions[materialIndex];
     if (!definition) return null;
@@ -2768,6 +2799,7 @@ var GLTFLilToonNodeExtension = class {
       (material) => this.#needsTangents(material)
     );
     for (const root of roots) generateLilToonOutlines(root);
+    for (const mesh of meshes) this.#applyRenderOrder(mesh);
     const warnings = [...this.#warnings].sort(([a], [b]) => a - b).flatMap(([, entries]) => entries);
     gltf.userData ??= {};
     gltf.userData.lilToonWarnings = warnings;
@@ -2854,6 +2886,20 @@ var GLTFLilToonNodeExtension = class {
       };
     }
   }
+  /**
+   * A transparent lilToon mesh gets the order of its `renderQueue` (lilToonRenderOrder), default 3000. An opaque or
+   * cutout mesh keeps its order, as the upstream WebGL plugin does. The outline pass is a group of the same mesh,
+   * so it has the same order.
+   */
+  #applyRenderOrder(mesh) {
+    const surface = Array.isArray(mesh.material) ? mesh.material[0] : mesh.material;
+    if (!(surface instanceof LilToonNodeMaterial) || !surface.transparent)
+      return;
+    const index = this.parser.associations.get(surface)?.materials;
+    if (index === void 0) return;
+    const queue = this.#definitions[index]?.renderQueue ?? LILTOON_TRANSPARENT_QUEUE;
+    mesh.renderOrder = lilToonRenderOrder(queue, this.#anchors);
+  }
   #needsTangents(material) {
     if (!(material instanceof LilToonNodeMaterial)) return false;
     const index = this.parser.associations.get(material)?.materials;
@@ -2876,6 +2922,27 @@ function keepLilToonFromMToon(json, materials) {
       extensions: { ...extensions, [materials.name]: definition }
     };
   });
+}
+function mtoonAnchors(gltf, parser) {
+  const json = parser.json;
+  const v0 = json.extensions?.VRM?.materialProperties;
+  const anchors = [];
+  const roots = gltf.scenes?.length ? gltf.scenes : [gltf.scene];
+  for (const root of roots)
+    root.traverse((object) => {
+      const mesh = object;
+      if (!mesh.isMesh) return;
+      const surface = Array.isArray(mesh.material) ? mesh.material[0] : mesh.material;
+      if (!surface?.transparent) return;
+      const index = parser.associations.get(surface)?.materials;
+      if (index === void 0) return;
+      const mtoon = json.materials?.[index]?.extensions?.[MTOON_EXTENSION];
+      if (!mtoon) return;
+      const offset = Number(mtoon.renderQueueOffsetNumber ?? 0);
+      const queue = v0?.[index]?.renderQueue ?? (mtoon.transparentWithZWrite ? 2501 : 3e3) + offset;
+      anchors.push({ queue: Number(queue), renderOrder: mesh.renderOrder });
+    });
+  return anchors;
 }
 function warnV0Binds(json, materials) {
   const groups = json.extensions?.VRM?.blendShapeMaster?.blendShapeGroups ?? [];
@@ -2932,10 +2999,11 @@ function enableLilToonNodeVRM(plugin, options = {}) {
     await originalAfterRoot.call(this, gltf);
     warnV0Binds(plugin.parser.json, materials);
     warnV1Binds(plugin.parser.json, materials);
+    materials.useRenderOrderAnchors(mtoonAnchors(gltf, plugin.parser));
     await materials.afterRoot(gltf);
   };
   enabled2.add(plugin);
   return enhanced;
 }
 
-export { GLTFLilToonNodeExtension, LILTOON_GLTF_EXTENSION, LILTOON_GLTF_SPEC_VERSION, LILTOON_NODE_FEATURES, LILTOON_NODE_VARIANTS, LilToonLightingModel, LilToonNodeMaterial, UNITY_LIGHT_SCALE, enableLilToonNodeVRM, ensureLilToonNodeTangents, generateLilToonOutlines, lilBand, lilBlendColor, lilLimitLight, lilOutlineWidth, lilToonShadingInputs, nodeProperties, nodeVariant, nodeWarnings, tslBacklight, tslBacklightColor, tslBlendColor, tslEmission, tslMatCap, tslOutlineColor, tslOutlinePosition, tslRim };
+export { GLTFLilToonNodeExtension, LILTOON_GLTF_EXTENSION, LILTOON_GLTF_SPEC_VERSION, LILTOON_NODE_FEATURES, LILTOON_NODE_VARIANTS, LILTOON_TRANSPARENT_QUEUE, LilToonLightingModel, LilToonNodeMaterial, UNITY_LIGHT_SCALE, enableLilToonNodeVRM, ensureLilToonNodeTangents, generateLilToonOutlines, lilBand, lilBlendColor, lilLimitLight, lilOutlineWidth, lilToonRenderOrder, lilToonShadingInputs, nodeProperties, nodeVariant, nodeWarnings, tslBacklight, tslBacklightColor, tslBlendColor, tslEmission, tslMatCap, tslOutlineColor, tslOutlinePosition, tslRim };

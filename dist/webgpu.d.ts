@@ -363,6 +363,27 @@ interface GLTFLilToonMaterialDefinition {
     cubeTextures?: Record<string, GLTFLilToonCubeTextureInfo>;
 }
 
+/** The default Unity queue of a transparent lilToon shader ("Queue" = "Transparent"). */
+declare const LILTOON_TRANSPARENT_QUEUE = 3000;
+/** A mesh that another loader ordered: its Unity render queue and the `renderOrder` it got. */
+interface RenderOrderAnchor {
+    queue: number;
+    renderOrder: number;
+}
+/**
+ * The `renderOrder` of a transparent mesh with a Unity render queue.
+ *
+ * Without anchors it is `queue - 2981`, the scheme of three-vrm 3.5.5 MToonMaterialLoaderPlugin._parseRenderOrder
+ * for a VRM 1 transparent material (queue 3000 + offset gives 19 + offset). So queue 3000 gives 19, as a default
+ * MToon transparent mesh.
+ *
+ * With anchors (the MToon meshes of the same file), the order goes between the anchors by queue. A queue equal to an
+ * anchor queue gets its order. A queue between two anchors gets an order between theirs, in proportion to the queue.
+ * A queue below or above all anchors gets an order less than 1 below the lowest or above the highest. Three-vrm
+ * gives VRM 0 queues consecutive orders by rank, so the result is often a fraction; `renderOrder` sorts as a number.
+ */
+declare function lilToonRenderOrder(queue: number, anchors?: readonly RenderOrderAnchor[]): number;
+
 /** `missing-texture`: a texture index that is not in the file or did not load. The material uses the neutral texture. */
 type LilToonNodeWarningCode = LilToonWarningCode | "missing-texture";
 interface LilToonNodeWarning extends Omit<LilToonWarning, "code"> {
@@ -377,8 +398,13 @@ interface GLTFLilToonNodeExtensionOptions {
 }
 /**
  * Loads `MOCHIYA_materials_liltoon` materials as LilToonNodeMaterial. A material without the extension falls through
- * to the next plugin. After the scene loads, it adds tangents for the normal map, adds the outline pass, and
- * publishes the warnings to `onWarning` and `gltf.userData.lilToonWarnings`.
+ * to the next plugin. After the scene loads, it adds tangents for the normal map, adds the outline pass, sets the
+ * `renderOrder` of each transparent lilToon mesh from its `renderQueue`, and publishes the warnings to `onWarning`
+ * and `gltf.userData.lilToonWarnings`.
+ *
+ * For a VRM, register only `enableLilToonNodeVRM(new VRMLoaderPlugin(parser))`, not this plugin. Registered
+ * separately next to `VRMLoaderPlugin`, the three-vrm MToon plugin also sets the render order of a lilToon mesh
+ * that has an MToon fallback and lists its material in `vrm.materials`.
  */
 declare class GLTFLilToonNodeExtension implements GLTFLoaderPlugin {
     #private;
@@ -394,6 +420,8 @@ declare class GLTFLilToonNodeExtension implements GLTFLoaderPlugin {
     materialName(materialIndex: number): string;
     /** Add a warning for a lilToon material. afterRoot publishes it with the material warnings. */
     addWarning(materialIndex: number, code: LilToonNodeWarningCode, property: string, message: string): void;
+    /** The queues and orders of the meshes that another loader ordered. afterRoot puts lilToon meshes between them. */
+    useRenderOrderAnchors(anchors: readonly RenderOrderAnchor[]): void;
     loadMaterial(materialIndex: number): Promise<Material> | null;
     afterRoot(gltf: GLTF): Promise<void>;
 }
@@ -419,4 +447,4 @@ declare function ensureLilToonNodeTangents(meshes: readonly Mesh[], needsTangent
  */
 declare function enableLilToonNodeVRM<T extends VRMLoaderPlugin>(plugin: T, options?: GLTFLilToonNodeExtensionOptions): T & Pick<GLTFLilToonNodeExtension, "loadMaterial">;
 
-export { type GLTFLilToonMaterialDefinition, GLTFLilToonNodeExtension, type GLTFLilToonNodeExtensionOptions, LILTOON_GLTF_EXTENSION, LILTOON_GLTF_SPEC_VERSION, LILTOON_NODE_FEATURES, LILTOON_NODE_VARIANTS, type LilToonLightingHost, LilToonLightingModel, LilToonNodeMaterial, type LilToonNodeMaterialParameters, type LilToonNodeMaterialType, type LilToonNodeMode, type LilToonNodeValue, type LilToonNodeVariant, type LilToonNodeWarning, type LilToonNodeWarningCode, type LilToonScalarOrVector, type LilToonShadingInputs, type LilToonSurface, UNITY_LIGHT_SCALE, enableLilToonNodeVRM, ensureLilToonNodeTangents, generateLilToonOutlines, lilBand, lilBlendColor, lilLimitLight, lilOutlineWidth, lilToonShadingInputs, nodeProperties, nodeVariant, nodeWarnings, tslBacklight, tslBacklightColor, tslBlendColor, tslEmission, tslMatCap, tslOutlineColor, tslOutlinePosition, tslRim };
+export { type GLTFLilToonMaterialDefinition, GLTFLilToonNodeExtension, type GLTFLilToonNodeExtensionOptions, LILTOON_GLTF_EXTENSION, LILTOON_GLTF_SPEC_VERSION, LILTOON_NODE_FEATURES, LILTOON_NODE_VARIANTS, LILTOON_TRANSPARENT_QUEUE, type LilToonLightingHost, LilToonLightingModel, LilToonNodeMaterial, type LilToonNodeMaterialParameters, type LilToonNodeMaterialType, type LilToonNodeMode, type LilToonNodeValue, type LilToonNodeVariant, type LilToonNodeWarning, type LilToonNodeWarningCode, type LilToonScalarOrVector, type LilToonShadingInputs, type LilToonSurface, type RenderOrderAnchor, UNITY_LIGHT_SCALE, enableLilToonNodeVRM, ensureLilToonNodeTangents, generateLilToonOutlines, lilBand, lilBlendColor, lilLimitLight, lilOutlineWidth, lilToonRenderOrder, lilToonShadingInputs, nodeProperties, nodeVariant, nodeWarnings, tslBacklight, tslBacklightColor, tslBlendColor, tslEmission, tslMatCap, tslOutlineColor, tslOutlinePosition, tslRim };

@@ -22,6 +22,7 @@ import {
 	GLTFLilToonNodeExtension,
 	LilToonNodeMaterial,
 	enableLilToonNodeVRM,
+	lilToonRenderOrder,
 	type LilToonNodeWarning as LilToonWarning,
 } from "../../src/webgpu";
 import { ensureLilToonNodeTangents } from "../../src/webgpu/tangents";
@@ -652,6 +653,63 @@ describe("GLTFLilToonNodeExtension", () => {
 			expect(lil.geometry.hasAttribute("tangent")).toBe(true);
 		});
 	});
+
+	describe("render order", () => {
+		const transparent = (name: string, renderQueue?: number, outline = false) =>
+			lilToon(name, {
+				shaderVariant: outline
+					? "Hidden/lilToonTransparentOutline"
+					: "Hidden/lilToonTransparent",
+				renderQueue,
+			});
+
+		it("orders transparent lilToon meshes by renderQueue and keeps the opaque order", async () => {
+			const { gltf } = await load(
+				documentWith([
+					transparent("Face 2996", 2996),
+					transparent("Face 3000", 3000),
+					lilToon("Opaque", { renderQueue: 2000 }),
+					transparent("Default"),
+					transparent("Outlined 2998", 2998, true),
+				]),
+			);
+			const [low, high, opaque, fallback, outlined] = meshes(gltf);
+			expect(low!.renderOrder).toBeLessThan(high!.renderOrder);
+			expect(low!.renderOrder).toBe(15);
+			expect(high!.renderOrder).toBe(19);
+			expect(opaque!.renderOrder).toBe(0);
+			// No renderQueue: the lilToon transparent queue 3000.
+			expect(fallback!.renderOrder).toBe(19);
+			// The outline is a group of the same mesh and draws with its order.
+			expect(outlined!.renderOrder).toBe(17);
+			expect(outlined!.material).toHaveLength(2);
+			expect(outlined!.geometry.groups.map((g) => g.materialIndex)).toEqual([
+				0, 1,
+			]);
+		});
+
+		it("puts a queue between, below, or above the anchor queues", () => {
+			const anchors = [
+				{ queue: 2990, renderOrder: 18 },
+				{ queue: 3000, renderOrder: 19 },
+			];
+			expect(lilToonRenderOrder(3000)).toBe(19);
+			expect(lilToonRenderOrder(2996)).toBe(15);
+			expect(lilToonRenderOrder(2990, anchors)).toBe(18);
+			expect(lilToonRenderOrder(2995, anchors)).toBe(18.5);
+			const below = lilToonRenderOrder(2980, anchors);
+			expect(below).toBeGreaterThan(17);
+			expect(below).toBeLessThan(18);
+			const above = lilToonRenderOrder(3005, anchors);
+			expect(above).toBeGreaterThan(19);
+			expect(above).toBeLessThan(20);
+			const orders = Array.from({ length: 60 }, (_, i) =>
+				lilToonRenderOrder(2970 + i, anchors),
+			);
+			for (let i = 1; i < orders.length; i++)
+				expect(orders[i]!).toBeGreaterThan(orders[i - 1]!);
+		});
+	});
 });
 
 describe("enableLilToonNodeVRM", () => {
@@ -836,6 +894,74 @@ describe("enableLilToonNodeVRM", () => {
 		expect([plugin.loadMaterial, plugin.afterRoot, plugin.beforeRoot]).toEqual(
 			hooks,
 		);
+	});
+
+	it("puts a VRM 0 lilToon queue between the MToon queues", async () => {
+		const transparentProperties = (name: string, renderQueue: number) => ({
+			...mtoonProperties(name),
+			renderQueue,
+			keywordMap: { _ALPHABLEND_ON: true },
+			floatProperties: { _ZWrite: 0 },
+		});
+		const lil = (name: string, renderQueue: number) =>
+			lilToon(name, {
+				shaderVariant: "Hidden/lilToonTransparent",
+				renderQueue,
+			});
+		const entries: [Json, number][] = [
+			[lil("Lil 2995", 2995), 2995],
+			[lil("Lil 3005", 3005), 3005],
+			[lil("Lil 2980", 2980), 2980],
+			[{ name: "MToon 2990" }, 2990],
+			[{ name: "MToon 3000" }, 3000],
+		];
+		const json = documentWith(entries.map(([material]) => material));
+		json.extensionsUsed.push("VRM");
+		// The lilToon materials also have their MToon fallback, as an exported VRM 0 has.
+		json.extensions = {
+			VRM: {
+				materialProperties: entries.map(([material, queue]) =>
+					transparentProperties(material.name, queue),
+				),
+			},
+		};
+		const { gltf } = await load(json, registerVRM());
+		const [lil2995, lil3005, lil2980, mtoon2990, mtoon3000] = meshes(gltf);
+		expect(surface(mtoon2990!)).toBeInstanceOf(MToonMaterial);
+		expect(surface(lil2995!)).toBeInstanceOf(LilToonNodeMaterial);
+		const order = [lil2980, mtoon2990, lil2995, mtoon3000, lil3005].map(
+			(mesh) => mesh!.renderOrder,
+		);
+		expect([...order].sort((a, b) => a - b)).toEqual(order);
+		expect(new Set(order).size).toBe(order.length);
+	});
+
+	it("puts a VRM 1 lilToon queue between the MToon queues", async () => {
+		const mtoon = (name: string, renderQueueOffsetNumber: number) => ({
+			name,
+			alphaMode: "BLEND",
+			extensions: {
+				VRMC_materials_mtoon: {
+					specVersion: "1.0",
+					transparentWithZWrite: false,
+					renderQueueOffsetNumber,
+				},
+			},
+		});
+		const json = documentWith([
+			mtoon("MToon 2995", -5),
+			lilToon("Lil 2997", {
+				shaderVariant: "Hidden/lilToonTransparent",
+				renderQueue: 2997,
+			}),
+			mtoon("MToon 3000", 0),
+		]);
+		const { gltf } = await load(json, registerVRM());
+		const [low, lil, high] = meshes(gltf);
+		expect(low!.renderOrder).toBe(14);
+		expect(high!.renderOrder).toBe(19);
+		expect(lil!.renderOrder).toBeGreaterThan(14);
+		expect(lil!.renderOrder).toBeLessThan(19);
 	});
 
 	it("still loads a plain glTF scene", async () => {

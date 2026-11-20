@@ -46,6 +46,11 @@ export {
 	type LilToonNodeWarningCode,
 } from "./webgpu/GLTFLilToonNodeExtension.js";
 export { ensureLilToonNodeTangents } from "./webgpu/tangents.js";
+export {
+	LILTOON_TRANSPARENT_QUEUE,
+	lilToonRenderOrder,
+	type RenderOrderAnchor,
+} from "./webgpu/renderOrder.js";
 export { enableLilToonNodeVRM } from "./webgpu/vrm.js";
 export {
 	LILTOON_GLTF_EXTENSION,

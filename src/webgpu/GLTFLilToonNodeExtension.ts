@@ -20,6 +20,11 @@ import {
 	type LilToonNodeMaterialParameters,
 } from "./LilToonNodeMaterial.js";
 import { generateLilToonOutlines } from "./outlines.js";
+import {
+	LILTOON_TRANSPARENT_QUEUE,
+	lilToonRenderOrder,
+	type RenderOrderAnchor,
+} from "./renderOrder.js";
 import { ensureLilToonNodeTangents } from "./tangents.js";
 
 /** `missing-texture`: a texture index that is not in the file or did not load. The material uses the neutral texture. */
@@ -59,8 +64,13 @@ const isMesh = (object: Object3D): object is Mesh =>
 
 /**
  * Loads `MOCHIYA_materials_liltoon` materials as LilToonNodeMaterial. A material without the extension falls through
- * to the next plugin. After the scene loads, it adds tangents for the normal map, adds the outline pass, and
- * publishes the warnings to `onWarning` and `gltf.userData.lilToonWarnings`.
+ * to the next plugin. After the scene loads, it adds tangents for the normal map, adds the outline pass, sets the
+ * `renderOrder` of each transparent lilToon mesh from its `renderQueue`, and publishes the warnings to `onWarning`
+ * and `gltf.userData.lilToonWarnings`.
+ *
+ * For a VRM, register only `enableLilToonNodeVRM(new VRMLoaderPlugin(parser))`, not this plugin. Registered
+ * separately next to `VRMLoaderPlugin`, the three-vrm MToon plugin also sets the render order of a lilToon mesh
+ * that has an MToon fallback and lists its material in `vrm.materials`.
  */
 export class GLTFLilToonNodeExtension implements GLTFLoaderPlugin {
 	readonly name = LILTOON_GLTF_EXTENSION;
@@ -72,6 +82,7 @@ export class GLTFLilToonNodeExtension implements GLTFLoaderPlugin {
 	readonly #names: readonly string[];
 	readonly #warnings = new Map<number, LilToonNodeWarning[]>();
 	readonly #tangentIndices = new Set<number>();
+	#anchors: readonly RenderOrderAnchor[] = [];
 
 	constructor(
 		readonly parser: GLTFParser,
@@ -124,6 +135,11 @@ export class GLTFLilToonNodeExtension implements GLTFLoaderPlugin {
 		this.#warnings.set(materialIndex, list);
 	}
 
+	/** The queues and orders of the meshes that another loader ordered. afterRoot puts lilToon meshes between them. */
+	useRenderOrderAnchors(anchors: readonly RenderOrderAnchor[]): void {
+		this.#anchors = [...anchors];
+	}
+
 	loadMaterial(materialIndex: number): Promise<Material> | null {
 		const definition = this.#definitions[materialIndex];
 		if (!definition) return null;
@@ -141,6 +157,7 @@ export class GLTFLilToonNodeExtension implements GLTFLoaderPlugin {
 			this.#needsTangents(material),
 		);
 		for (const root of roots) generateLilToonOutlines(root);
+		for (const mesh of meshes) this.#applyRenderOrder(mesh);
 		// Material indices order the warnings and remove the copies that GLTFLoader makes of a material.
 		const warnings = [...this.#warnings]
 			.sort(([a], [b]) => a - b)
@@ -250,6 +267,24 @@ export class GLTFLilToonNodeExtension implements GLTFLoaderPlugin {
 				warning: `${property} texture ${index} did not load (${reason}). ${fallback}`,
 			};
 		}
+	}
+
+	/**
+	 * A transparent lilToon mesh gets the order of its `renderQueue` (lilToonRenderOrder), default 3000. An opaque or
+	 * cutout mesh keeps its order, as the upstream WebGL plugin does. The outline pass is a group of the same mesh,
+	 * so it has the same order.
+	 */
+	#applyRenderOrder(mesh: Mesh): void {
+		const surface = Array.isArray(mesh.material)
+			? mesh.material[0]
+			: mesh.material;
+		if (!(surface instanceof LilToonNodeMaterial) || !surface.transparent)
+			return;
+		const index = this.parser.associations.get(surface)?.materials;
+		if (index === undefined) return;
+		const queue =
+			this.#definitions[index]?.renderQueue ?? LILTOON_TRANSPARENT_QUEUE;
+		mesh.renderOrder = lilToonRenderOrder(queue, this.#anchors);
 	}
 
 	#needsTangents(material: Material): boolean {
