@@ -180,7 +180,7 @@ The WebGPU material implements:
 
 Other shaders draw as `lilToon` and other features are not drawn. VRM expression material binds (VRM 0 `materialValues`, VRM 1 `materialColorBinds` and `textureTransformBinds`) on a lilToon material are not applied.
 
-Each of these gives a warning, and the model still loads. A texture index that is not in the file or does not load gives the neutral texture and a `missing-texture` warning. A spec version other than 1.0 to 1.3 gives `spec-version-mismatch`. Each warning names the material, the material index, and the property. The loader sends the warnings to `onWarning`, or to the console without it, and puts them in `gltf.userData.lilToonWarnings`.
+Each of these gives a warning, and the model still loads. A texture index that is not in the file or does not load gives the neutral texture and a `missing-texture` warning. A spec version other than 1.0 to 1.3 gives `spec-version-mismatch`. A property value of a wrong type or length (null, a string, an object, a scalar for a vector, a vector for a scalar, or a too long array) keeps the default of the property and gives `invalid-property-value`. Each warning names the material, the material index, and the property. The loader sends the warnings to `onWarning`, or to the console without it, and puts them in `gltf.userData.lilToonWarnings`.
 
 ## Compatibility
 
