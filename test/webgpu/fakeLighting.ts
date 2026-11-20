@@ -18,7 +18,7 @@ const fakeContext = () => ({
 	outgoingLight: vec3().toVar(),
 });
 
-type StackEntry = { targetNode?: Node & { name?: string }; sourceNode?: Node };
+export type StackEntry = { targetNode?: Node & { name?: string }; sourceNode?: Node };
 
 export const runModel = (
 	source: LilToonNodeMaterial | LilToonLightingModel,
@@ -70,7 +70,7 @@ export const runModel = (
 		entries
 			.filter((node) => node.targetNode?.name === name)
 			.map((node) => node.sourceNode);
-	return { ...context, assigned, outgoing, sourcesOf };
+	return { ...context, assigned, outgoing, sourcesOf, entries };
 };
 
 // The getShadow hook that setupLighting puts into the lighting context.

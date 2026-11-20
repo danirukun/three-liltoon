@@ -266,7 +266,8 @@ export class LilToonLightingModel extends LightingModel {
 	override start(builder: NodeBuilder): void {
 		this.#light = vec3().toVar("lilLight");
 		this.#weight = float().toVar("lilLightWeight");
-		this.#bands = vec4().toVar("lilBands");
+		// vec4() with no value is a Vector4, whose w is 1: the border band would start at 1 and extrapolate past the lit color.
+		this.#bands = vec4(0, 0, 0, 0).toVar("lilBands");
 		this.#ambient = vec3().toVar("lilAmbient");
 		this.#backlight = float().toVar("lilBacklight");
 		if (this.#host.features.has("shadow")) {

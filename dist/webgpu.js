@@ -1757,7 +1757,7 @@ var LilToonLightingModel = class extends LightingModel {
   start(builder) {
     this.#light = vec3().toVar("lilLight");
     this.#weight = float().toVar("lilLightWeight");
-    this.#bands = vec4().toVar("lilBands");
+    this.#bands = vec4(0, 0, 0, 0).toVar("lilBands");
     this.#ambient = vec3().toVar("lilAmbient");
     this.#backlight = float().toVar("lilBacklight");
     if (this.#host.features.has("shadow")) {

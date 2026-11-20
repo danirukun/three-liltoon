@@ -122,6 +122,19 @@ describe("LilToonLightingModel", () => {
 		]);
 	});
 
+	it("starts the band sum at zero in all four components", () => {
+		// vec4() with no value is a Vector4 with w 1. The fourth component is the shadow border band (lns.w), which
+		// lilShade multiplies into _ShadowBorderColor; a start value of 1 lifts the red channel of every pixel.
+		const material = new LilToonNodeMaterial({ properties: { _UseShadow: 1 } });
+		const { entries } = runModel(material, [{ shadowNode: null, baseColorNode: null }]);
+		const bands = entries.find((entry) => entry.targetNode?.name === "lilBands")?.targetNode as
+			| (Node & { node: { value: { x: number; y: number; z: number; w: number } } })
+			| undefined;
+		expect(bands).toBeDefined();
+		const { x, y, z, w } = bands!.node.value;
+		expect([x, y, z, w]).toEqual([0, 0, 0, 0]);
+	});
+
 	it("only sums the light without _UseShadow", () => {
 		const { assigned } = runModel(new LilToonNodeMaterial(), [
 			{ shadowNode: null, baseColorNode: null },
