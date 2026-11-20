@@ -1,4 +1,4 @@
-import { BackSide, FrontSide, DoubleSide, Vector2, Vector3, Vector4, SRGBColorSpace, LinearSRGBColorSpace, RepeatWrapping, DataTexture, RGBAFormat, UnsignedByteType, LinearFilter } from 'three';
+import { BackSide, FrontSide, DoubleSide, Vector2, Vector3, Vector4, SRGBColorSpace, LinearSRGBColorSpace, RepeatWrapping, BufferAttribute, DataTexture, RGBAFormat, UnsignedByteType, LinearFilter } from 'three';
 import { LightingModel, NodeMaterial } from 'three/webgpu';
 import { positionLocal, uv, select, max, mix, pow, saturate as saturate$1, dot, positionViewDirection, normalize, float, abs, sqrt, modelWorldMatrix, vec4, length, cameraPosition, normalLocal, vec3, normalView, normalViewGeometry, frontFacing, diffuseColor, vec2, dFdx, dFdy, context, texture, normalMap, fwidth, faceDirection, cameraProjectionMatrix, cameraViewMatrix, cross, sin, time, round, min, uniform, clamp } from 'three/tsl';
 
@@ -2174,7 +2174,7 @@ function nodeWarnings(name, properties, _textures, shaderVariant) {
       message: `${property} is enabled, but the WebGPU material does not implement it. The model will load without this feature.`
     });
   }
-  const enabled2 = new Set(enabledNodeFeatures(selection.variant, merged));
+  const enabled3 = new Set(enabledNodeFeatures(selection.variant, merged));
   const warn = (property, message) => warnings.push({
     severity: "warning",
     code: "unsupported-feature",
@@ -2185,7 +2185,7 @@ function nodeWarnings(name, properties, _textures, shaderVariant) {
   });
   for (const [feature, property] of UNSUPPORTED_VALUES) {
     const value = merged[property];
-    if (!enabled2.has(feature) || typeof value !== "number" || value === 0)
+    if (!enabled3.has(feature) || typeof value !== "number" || value === 0)
       continue;
     warn(
       property,
@@ -2203,7 +2203,7 @@ function nodeWarnings(name, properties, _textures, shaderVariant) {
   }
   for (const [feature, property] of BLEND_MODES) {
     const value = merged[property];
-    if (!enabled2.has(feature) || typeof value !== "number") continue;
+    if (!enabled3.has(feature) || typeof value !== "number") continue;
     if (isLilBlendMode(value)) continue;
     warn(
       property,
@@ -2559,10 +2559,383 @@ function generateLilToonOutlines(root) {
   });
 }
 
-// src/webgpu.ts
-var GLTFLilToonNodeExtension = class {
+// src/loaders/types.ts
+var LILTOON_GLTF_EXTENSION = "MOCHIYA_materials_liltoon";
+var LILTOON_GLTF_SPEC_VERSION = "1.3";
+
+// src/utils/diagnostics.ts
+function warnLilToon(message) {
+  console.warn(`[three-liltoon] ${message}`);
+}
+function generateIndexedTangents(geometry, mikk) {
+  const index = geometry.index;
+  const position = geometry.getAttribute("position");
+  const count = index?.count ?? position.count;
+  const corners = (attribute, size) => {
+    const result = new Float32Array(count * size);
+    for (let corner = 0; corner < count; corner++) {
+      const vertex = index ? index.getX(corner) : corner;
+      result[corner * size] = attribute.getX(vertex);
+      result[corner * size + 1] = attribute.getY(vertex);
+      if (size === 3) result[corner * size + 2] = attribute.getZ(vertex);
+    }
+    return result;
+  };
+  const tangents = mikk.generateTangents(
+    corners(position, 3),
+    corners(geometry.getAttribute("normal"), 3),
+    corners(geometry.getAttribute("uv"), 2)
+  );
+  for (let i = 3; i < tangents.length; i += 4) tangents[i] *= -1;
+  if (!index) {
+    geometry.setAttribute("tangent", new BufferAttribute(tangents, 4));
+    return;
+  }
+  const bits = new Uint32Array(
+    tangents.buffer,
+    tangents.byteOffset,
+    tangents.length
+  );
+  const vertices = [], tangentCorners = [], indices = new Uint32Array(count);
+  const groups = /* @__PURE__ */ new Map();
+  for (let corner = 0; corner < count; corner++) {
+    const original = index.getX(corner), offset = corner * 4;
+    const key = `${original}/${bits[offset]}/${bits[offset + 1]}/${bits[offset + 2]}/${bits[offset + 3]}`;
+    let vertex = groups.get(key);
+    if (vertex === void 0) {
+      vertex = vertices.length;
+      groups.set(key, vertex);
+      vertices.push(original);
+      tangentCorners.push(corner);
+    }
+    indices[corner] = vertex;
+  }
+  const remapped = /* @__PURE__ */ new Map();
+  const remap = (attribute) => {
+    const existing = remapped.get(attribute);
+    if (existing) return existing;
+    const ArrayType = attribute.array.constructor;
+    const array = new ArrayType(vertices.length * attribute.itemSize);
+    const interleaved = "data" in attribute;
+    const stride = interleaved ? attribute.data.stride : attribute.itemSize;
+    const offset = interleaved ? attribute.offset : 0;
+    for (let v = 0; v < vertices.length; v++)
+      for (let c = 0; c < attribute.itemSize; c++)
+        array[v * attribute.itemSize + c] = attribute.array[vertices[v] * stride + offset + c];
+    const result = new BufferAttribute(
+      array,
+      attribute.itemSize,
+      attribute.normalized
+    );
+    result.name = attribute.name;
+    result.setUsage(interleaved ? attribute.data.usage : attribute.usage);
+    if (!interleaved) result.gpuType = attribute.gpuType;
+    remapped.set(attribute, result);
+    return result;
+  };
+  for (const [name, attribute] of Object.entries(geometry.attributes))
+    geometry.setAttribute(name, remap(attribute));
+  for (const name of Object.keys(
+    geometry.morphAttributes
+  )) {
+    geometry.morphAttributes[name] = geometry.morphAttributes[name]?.map(remap);
+  }
+  const indexedTangents = new Float32Array(vertices.length * 4);
+  tangentCorners.forEach(
+    (corner, vertex) => indexedTangents.set(
+      tangents.subarray(corner * 4, corner * 4 + 4),
+      vertex * 4
+    )
+  );
+  geometry.setAttribute("tangent", new BufferAttribute(indexedTangents, 4));
+  geometry.setIndex(
+    new BufferAttribute(
+      vertices.length <= 65535 ? new Uint16Array(indices) : indices,
+      1
+    )
+  );
+}
+
+// src/webgpu/tangents.ts
+var materialsOf = (mesh) => Array.isArray(mesh.material) ? mesh.material : [mesh.material];
+var canGenerate = (geometry) => geometry.hasAttribute("position") && geometry.hasAttribute("normal") && geometry.hasAttribute("uv");
+var usesDerivativeNormalMap = (material) => material.normalMap != null;
+async function ensureLilToonNodeTangents(meshes, needsTangents) {
+  const users = /* @__PURE__ */ new Map();
+  for (const mesh of meshes) {
+    const list = users.get(mesh.geometry) ?? [];
+    list.push(mesh);
+    users.set(mesh.geometry, list);
+  }
+  const work = [];
+  for (const [geometry, list] of users) {
+    if (geometry.hasAttribute("tangent") || !canGenerate(geometry)) continue;
+    const targets = list.filter(
+      (mesh) => materialsOf(mesh).some(needsTangents)
+    );
+    if (targets.length === 0) continue;
+    const shared = list.some(
+      (mesh) => !targets.includes(mesh) && materialsOf(mesh).some(usesDerivativeNormalMap)
+    );
+    if (!shared) {
+      work.push(geometry);
+      continue;
+    }
+    const copy = geometry.clone();
+    for (const mesh of targets) mesh.geometry = copy;
+    work.push(copy);
+  }
+  if (work.length === 0) return;
+  const MikkTSpace = await import('three/examples/jsm/libs/mikktspace.module.js');
+  await MikkTSpace.ready;
+  for (const geometry of work) generateIndexedTangents(geometry, MikkTSpace);
+}
+
+// src/webgpu/GLTFLilToonNodeExtension.ts
+var SPEC_VERSIONS = /* @__PURE__ */ new Set([
+  "1.0",
+  "1.1",
+  "1.2",
+  LILTOON_GLTF_SPEC_VERSION
+]);
+var LEGACY_VARIANTS = {
+  opaque: void 0,
+  cutout: "Hidden/lilToonCutout",
+  transparent: "Hidden/lilToonTransparent"
 };
-var enableLilToonNodeVRM = () => {
+var isMesh2 = (object) => object.isMesh === true;
+var GLTFLilToonNodeExtension = class {
+  constructor(parser, options = {}) {
+    this.parser = parser;
+    this.options = options;
+    const materials = parser.json?.materials ?? [];
+    this.#definitions = materials.map(
+      (material) => material?.extensions?.[this.name]
+    );
+    this.#names = materials.map((material) => material?.name ?? "");
+  }
+  parser;
+  options;
+  name = LILTOON_GLTF_EXTENSION;
+  /**
+   * The extension and name of each material, read when the plugin is made. The VRM 0 plugin of three-vrm replaces
+   * the material JSON of an MToon material in beforeRoot and drops the other extensions.
+   */
+  #definitions;
+  #names;
+  #warnings = /* @__PURE__ */ new Map();
+  #tangentIndices = /* @__PURE__ */ new Set();
+  /** The material has the extension. */
+  isLilToonMaterial(materialIndex) {
+    return this.#definitions[materialIndex] !== void 0;
+  }
+  /** The extension of the material as the file had it, or undefined. */
+  definition(materialIndex) {
+    return this.#definitions[materialIndex];
+  }
+  /** The glTF name of the material. */
+  materialName(materialIndex) {
+    return this.#names[materialIndex] ?? "";
+  }
+  /** Add a warning for a lilToon material. afterRoot publishes it with the material warnings. */
+  addWarning(materialIndex, code, property, message) {
+    const list = this.#warnings.get(materialIndex) ?? [];
+    list.push({
+      severity: "warning",
+      code,
+      materialName: this.materialName(materialIndex),
+      materialIndex,
+      shaderKey: this.#definitions[materialIndex]?.shaderVariant ?? "lilToon",
+      property,
+      message
+    });
+    this.#warnings.set(materialIndex, list);
+  }
+  loadMaterial(materialIndex) {
+    const definition = this.#definitions[materialIndex];
+    if (!definition) return null;
+    return this.#load(materialIndex, definition);
+  }
+  async afterRoot(gltf) {
+    const roots = gltf.scenes?.length ? gltf.scenes : [gltf.scene];
+    const meshes = /* @__PURE__ */ new Set();
+    for (const root of roots)
+      root.traverse((object) => {
+        if (isMesh2(object)) meshes.add(object);
+      });
+    await ensureLilToonNodeTangents(
+      [...meshes],
+      (material) => this.#needsTangents(material)
+    );
+    for (const root of roots) generateLilToonOutlines(root);
+    const warnings = [...this.#warnings].sort(([a], [b]) => a - b).flatMap(([, entries]) => entries);
+    gltf.userData ??= {};
+    gltf.userData.lilToonWarnings = warnings;
+    for (const warning of warnings) {
+      if (this.options.onWarning) this.options.onWarning({ ...warning });
+      else
+        warnLilToon(
+          `${warning.materialName} (material ${warning.materialIndex}, ${warning.property}): ${warning.message}`
+        );
+    }
+  }
+  async #load(materialIndex, definition) {
+    const textures = {};
+    const missing = [];
+    await Promise.all(
+      Object.entries(definition.textures ?? {}).map(
+        async ([property, info]) => {
+          const result = await this.#texture(property, info);
+          textures[property] = result.texture;
+          if (result.warning) missing.push([property, result.warning]);
+        }
+      )
+    );
+    const { shaderVariant, renderMode } = definition;
+    const legacy = shaderVariant === void 0 && renderMode !== void 0 ? LEGACY_VARIANTS[renderMode] : void 0;
+    const MaterialType = this.options.materialType ?? LilToonNodeMaterial;
+    const material = new MaterialType({
+      name: this.materialName(materialIndex),
+      shaderVariant: shaderVariant ?? legacy,
+      properties: definition.properties ?? {},
+      textures
+    });
+    this.parser.associations.set(material, { materials: materialIndex });
+    if (Number(material.getProperty("_UseBumpMap") ?? 0) !== 0 && textures._BumpMap != null)
+      this.#tangentIndices.add(materialIndex);
+    const { specVersion } = definition;
+    if (specVersion !== void 0 && !SPEC_VERSIONS.has(String(specVersion)))
+      this.addWarning(
+        materialIndex,
+        "spec-version-mismatch",
+        "specVersion",
+        `The material uses ${this.name} spec ${String(specVersion)}. This build reads 1.0 to ${LILTOON_GLTF_SPEC_VERSION}. The material loads with the properties it knows.`
+      );
+    if (shaderVariant === void 0 && renderMode !== void 0 && !Object.hasOwn(LEGACY_VARIANTS, renderMode))
+      this.addWarning(
+        materialIndex,
+        "unsupported-shader-variant",
+        "renderMode",
+        `renderMode ${renderMode} is not implemented for WebGPU. The material uses lilToon.`
+      );
+    for (const warning of material.getWarnings()) {
+      const list = this.#warnings.get(materialIndex) ?? [];
+      list.push({ ...warning, materialIndex });
+      this.#warnings.set(materialIndex, list);
+    }
+    for (const [property, message] of missing)
+      this.addWarning(materialIndex, "missing-texture", property, message);
+    return material;
+  }
+  async #texture(property, info) {
+    const index = typeof info === "number" ? info : info?.index;
+    const count = this.parser.json.textures?.length ?? 0;
+    const fallback = "The material uses the neutral texture.";
+    if (!Number.isInteger(index) || index < 0 || index >= count)
+      return {
+        texture: null,
+        warning: `${property} uses texture index ${String(index)}, and the file has ${count} textures. ${fallback}`
+      };
+    try {
+      const texture2 = await this.parser.getDependency(
+        "texture",
+        index
+      );
+      if (texture2) return { texture: texture2 };
+      return {
+        texture: null,
+        warning: `${property} texture ${index} did not load. ${fallback}`
+      };
+    } catch (error) {
+      const reason = error instanceof Error ? error.message : String(error);
+      return {
+        texture: null,
+        warning: `${property} texture ${index} did not load (${reason}). ${fallback}`
+      };
+    }
+  }
+  #needsTangents(material) {
+    if (!(material instanceof LilToonNodeMaterial)) return false;
+    const index = this.parser.associations.get(material)?.materials;
+    return index !== void 0 && this.#tangentIndices.has(index);
+  }
 };
 
-export { GLTFLilToonNodeExtension, LILTOON_NODE_FEATURES, LILTOON_NODE_VARIANTS, LilToonLightingModel, LilToonNodeMaterial, UNITY_LIGHT_SCALE, enableLilToonNodeVRM, generateLilToonOutlines, lilBand, lilBlendColor, lilLimitLight, lilOutlineWidth, lilToonShadingInputs, nodeProperties, nodeVariant, nodeWarnings, tslBacklight, tslBacklightColor, tslBlendColor, tslEmission, tslMatCap, tslOutlineColor, tslOutlinePosition, tslRim };
+// src/webgpu/vrm.ts
+var MTOON_EXTENSION = "VRMC_materials_mtoon";
+var NO_BINDS = "The WebGPU lilToon material does not apply expression material binds. The expression does not change this material.";
+var enabled2 = /* @__PURE__ */ new WeakSet();
+function keepLilToonFromMToon(json, materials) {
+  const list = json.materials;
+  list?.forEach((material, index) => {
+    const definition = materials.definition(index);
+    if (!material || !definition) return;
+    const { [MTOON_EXTENSION]: _mtoon, ...extensions } = material.extensions ?? {};
+    list[index] = {
+      ...material,
+      extensions: { ...extensions, [materials.name]: definition }
+    };
+  });
+}
+function warnV0Binds(json, materials) {
+  const groups = json.extensions?.VRM?.blendShapeMaster?.blendShapeGroups ?? [];
+  const count = json.materials?.length ?? 0;
+  for (const group of groups)
+    for (const value of group.materialValues ?? [])
+      for (let index = 0; index < count; index++) {
+        if (!materials.isLilToonMaterial(index)) continue;
+        const name = materials.materialName(index);
+        if (value.materialName !== name && value.materialName !== `${name} (Outline)`)
+          continue;
+        materials.addWarning(
+          index,
+          "unsupported-feature",
+          String(value.propertyName ?? "materialValues"),
+          `VRM 0 blend shape ${String(group.name ?? group.presetName)} binds ${String(value.propertyName)}. ${NO_BINDS}`
+        );
+      }
+}
+function warnV1Binds(json, materials) {
+  const expressions = json.extensions?.VRMC_vrm?.expressions;
+  const entries = [
+    ...Object.entries(expressions?.preset ?? {}),
+    ...Object.entries(expressions?.custom ?? {})
+  ];
+  for (const [name, expression] of entries)
+    for (const kind of ["materialColorBinds", "textureTransformBinds"])
+      for (const bind of expression?.[kind] ?? []) {
+        if (!materials.isLilToonMaterial(bind.material)) continue;
+        const what = kind === "materialColorBinds" ? `the ${String(bind.type)} color` : "the texture transform";
+        materials.addWarning(
+          bind.material,
+          "unsupported-feature",
+          kind,
+          `VRM expression ${name} binds ${what}. ${NO_BINDS}`
+        );
+      }
+}
+function enableLilToonNodeVRM(plugin, options = {}) {
+  const enhanced = plugin;
+  if (enabled2.has(plugin)) return enhanced;
+  const materials = new GLTFLilToonNodeExtension(plugin.parser, options);
+  const originalLoadMaterial = plugin.loadMaterial;
+  const originalBeforeRoot = plugin.beforeRoot;
+  const originalAfterRoot = plugin.afterRoot;
+  enhanced.loadMaterial = function(index) {
+    return materials.loadMaterial(index) ?? originalLoadMaterial?.call(this, index) ?? null;
+  };
+  plugin.beforeRoot = async function() {
+    await originalBeforeRoot.call(this);
+    keepLilToonFromMToon(plugin.parser.json, materials);
+  };
+  plugin.afterRoot = async function(gltf) {
+    await originalAfterRoot.call(this, gltf);
+    warnV0Binds(plugin.parser.json, materials);
+    warnV1Binds(plugin.parser.json, materials);
+    await materials.afterRoot(gltf);
+  };
+  enabled2.add(plugin);
+  return enhanced;
+}
+
+export { GLTFLilToonNodeExtension, LILTOON_GLTF_EXTENSION, LILTOON_GLTF_SPEC_VERSION, LILTOON_NODE_FEATURES, LILTOON_NODE_VARIANTS, LilToonLightingModel, LilToonNodeMaterial, UNITY_LIGHT_SCALE, enableLilToonNodeVRM, ensureLilToonNodeTangents, generateLilToonOutlines, lilBand, lilBlendColor, lilLimitLight, lilOutlineWidth, lilToonShadingInputs, nodeProperties, nodeVariant, nodeWarnings, tslBacklight, tslBacklightColor, tslBlendColor, tslEmission, tslMatCap, tslOutlineColor, tslOutlinePosition, tslRim };

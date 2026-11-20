@@ -1,4 +1,3 @@
-// Later tasks replace the placeholders with the WebGPU implementation.
 export {
 	LilToonNodeMaterial,
 	type LilToonNodeMaterialParameters,
@@ -39,7 +38,17 @@ export {
 	type LilToonNodeVariant,
 	type LilToonScalarOrVector,
 } from "./webgpu/properties.js";
-
-export class GLTFLilToonNodeExtension {}
-
-export const enableLilToonNodeVRM = (): void => {};
+export {
+	GLTFLilToonNodeExtension,
+	type GLTFLilToonNodeExtensionOptions,
+	type LilToonNodeMaterialType,
+	type LilToonNodeWarning,
+	type LilToonNodeWarningCode,
+} from "./webgpu/GLTFLilToonNodeExtension.js";
+export { ensureLilToonNodeTangents } from "./webgpu/tangents.js";
+export { enableLilToonNodeVRM } from "./webgpu/vrm.js";
+export {
+	LILTOON_GLTF_EXTENSION,
+	LILTOON_GLTF_SPEC_VERSION,
+	type GLTFLilToonMaterialDefinition,
+} from "./loaders/types.js";

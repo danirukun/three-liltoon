@@ -134,6 +134,54 @@ renderer.setAnimationLoop((time) => {
 
 The enhanced VRM plugin already includes lilToon loading, so do not register both configurations on the same loader. It also works with ordinary GLB files. Three-VRM owns humanoid, expression and spring-bone updates; three-liltoon adapts supported material-expression bindings. Playing VRMA requires the application's usual animation loading and retargeting setup. [VRM integration details](https://github.com/mochiya-labs/three-liltoon/blob/main/docs/API.md#vrm-material-expressions)
 
+## WebGPU
+
+The `webgpu` entry draws lilToon materials with the Three.js `WebGPURenderer` as node materials (TSL). It does not use the WebGL shaders or `enableLilToon`.
+
+Load a GLB or glTF:
+
+```ts
+import { WebGPURenderer } from "three/webgpu";
+import { GLTFLoader } from "three/examples/jsm/loaders/GLTFLoader.js";
+import { GLTFLilToonNodeExtension } from "@mochiya/three-liltoon/webgpu";
+
+const renderer = new WebGPURenderer({ antialias: true });
+await renderer.init();
+
+const loader = new GLTFLoader();
+loader.register((parser) => new GLTFLilToonNodeExtension(parser));
+const gltf = await loader.loadAsync("/model.glb");
+scene.add(gltf.scene);
+```
+
+Load a VRM avatar. Register only this plugin; it includes the lilToon loading:
+
+```ts
+import { VRMLoaderPlugin } from "@pixiv/three-vrm";
+import { enableLilToonNodeVRM } from "@mochiya/three-liltoon/webgpu";
+
+const loader = new GLTFLoader();
+loader.register((parser) =>
+	enableLilToonNodeVRM(new VRMLoaderPlugin(parser), {
+		onWarning: (warning) => console.warn(warning),
+	}),
+);
+const gltf = await loader.loadAsync("/avatar.vrm");
+scene.add(gltf.userData.vrm?.scene ?? gltf.scene);
+```
+
+A material with `MOCHIYA_materials_liltoon` becomes a `LilToonNodeMaterial`, also when the file has an MToon fallback for it. Other materials load as usual. `materialType` in the options selects a subclass.
+
+The WebGPU material implements:
+
+- Shaders: `lilToon`, `Hidden/lilToonCutout`, `Hidden/lilToonTransparent`, `Hidden/lilToonOnePassTransparent`, and the `Outline` version of each.
+- Main color and `_MainTex`, the three shadow bands with masks, the normal map, MatCap, rim light, backlight, emission, and the outline pass.
+- Tangents for a mesh whose material uses `_UseBumpMap` with a `_BumpMap`, when the file has none.
+
+Other shaders draw as `lilToon` and other features are not drawn. VRM expression material binds (VRM 0 `materialValues`, VRM 1 `materialColorBinds` and `textureTransformBinds`) on a lilToon material are not applied.
+
+Each of these gives a warning, and the model still loads. A texture index that is not in the file or does not load gives the neutral texture and a `missing-texture` warning. A spec version other than 1.0 to 1.3 gives `spec-version-mismatch`. Each warning names the material, the material index, and the property. The loader sends the warnings to `onWarning`, or to the console without it, and puts them in `gltf.userData.lilToonWarnings`.
+
 ## Compatibility
 
 ### Exporter and runtime versions

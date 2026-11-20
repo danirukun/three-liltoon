@@ -1,5 +1,10 @@
-import { Color, Vector2, Vector3, Vector4, Texture, Object3D } from 'three';
+import { Color, Vector2, Vector3, Vector4, Texture, Object3D, Material, Mesh } from 'three';
 import { NodeMaterial, LightingModel, NodeBuilder, Node, UniformNode, TextureNode as TextureNode$1, LightingModelDirectInput } from 'three/webgpu';
+import { GLTFLoaderPlugin, GLTFParser, GLTF } from 'three/examples/jsm/loaders/GLTFLoader.js';
+import { VRMLoaderPlugin } from '@pixiv/three-vrm';
+
+type LilToonRenderMode = "opaque" | "cutout" | "transparent" | "refraction" | "refraction-blur" | "fur" | "fur-cutout" | "fur-two-pass" | "gem";
+type LilToonTransparencyMode = "normal" | "one-pass" | "two-pass";
 
 /** Supported Unity shader names and their pass configurations. */
 declare const shaderVariants: {
@@ -297,8 +302,121 @@ declare const tslOutlineColor: (inputs: LilToonShadingInputs) => Vec4;
  */
 declare function generateLilToonOutlines(root: Object3D): void;
 
-declare class GLTFLilToonNodeExtension {
+declare const LILTOON_GLTF_EXTENSION = "MOCHIYA_materials_liltoon";
+declare const LILTOON_GLTF_SPEC_VERSION = "1.3";
+/**
+ * A zero-based glTF index.
+ * @asType integer
+ * @minimum 0
+ */
+type GLTFIndex = number;
+/** JSON property values. Colors and vectors use numeric arrays, not Three.js objects. */
+type GLTFLilToonPropertyValue = number | boolean | number[];
+/** A reference to a texture in the enclosing glTF document. */
+interface GLTFLilToonTextureInfo {
+    /** Index into the glTF textures array. */
+    index: GLTFIndex;
+    /**
+     * Texture coordinate set. The current renderer uses TEXCOORD_0 only.
+     * @default 0
+     */
+    texCoord?: GLTFIndex;
 }
-declare const enableLilToonNodeVRM: () => void;
+/** Linear, little-endian RGBA binary16 cubemap in glTF world coordinates. */
+interface GLTFLilToonCubeTextureInfo {
+    encoding: "rgba16f-linear";
+    /** Square base face size; power of two. @asType integer @minimum 1 */
+    size: number;
+    /** Base level followed by every authored level down to 1x1, or base only.
+     * Each bufferView contains six tightly packed faces: +X,-X,+Y,-Y,+Z,-Z.
+     * @minItems 1
+     */
+    mipmaps: GLTFIndex[];
+}
+/** Material extension payload at materials[i].extensions.MOCHIYA_materials_liltoon. */
+interface GLTFLilToonMaterialDefinition {
+    /** Extension version. When omitted, the current version is assumed. */
+    specVersion?: "1.0" | "1.1" | "1.2" | typeof LILTOON_GLTF_SPEC_VERSION;
+    /** Source lilToon version, retained as metadata. */
+    lilToonVersion?: string | number;
+    /** Original Unity shader name. Supported regular names select surface, transparency and outline passes; unsupported names warn and use fallback. */
+    shaderVariant?: string;
+    /** Effective Unity material queue. Does not change blending or depth state.
+     * @asType integer
+     * @minimum 0
+     * @maximum 5000
+     */
+    renderQueue?: number;
+    /** Legacy fallback without a supported shaderVariant. Recognized shader names take precedence; new writers omit this field.
+     * @deprecated
+     */
+    renderMode?: LilToonRenderMode;
+    /** Legacy fallback without a supported shaderVariant. Recognized shader names take precedence; new writers omit this field.
+     * @deprecated
+     */
+    transparencyMode?: LilToonTransparencyMode;
+    /** Original property names and linear values, including per-texture <name>_ST transforms. */
+    properties?: Record<string, GLTFLilToonPropertyValue>;
+    /** Original texture property names mapped to glTF texture indices or texture-info objects. */
+    textures?: Record<string, GLTFLilToonTextureInfo | GLTFIndex>;
+    /** Direction-sampled resources, separate from ordinary glTF 2D textures. */
+    cubeTextures?: Record<string, GLTFLilToonCubeTextureInfo>;
+}
 
-export { GLTFLilToonNodeExtension, LILTOON_NODE_FEATURES, LILTOON_NODE_VARIANTS, type LilToonLightingHost, LilToonLightingModel, LilToonNodeMaterial, type LilToonNodeMaterialParameters, type LilToonNodeMode, type LilToonNodeValue, type LilToonNodeVariant, type LilToonScalarOrVector, type LilToonShadingInputs, type LilToonSurface, UNITY_LIGHT_SCALE, enableLilToonNodeVRM, generateLilToonOutlines, lilBand, lilBlendColor, lilLimitLight, lilOutlineWidth, lilToonShadingInputs, nodeProperties, nodeVariant, nodeWarnings, tslBacklight, tslBacklightColor, tslBlendColor, tslEmission, tslMatCap, tslOutlineColor, tslOutlinePosition, tslRim };
+/** `missing-texture`: a texture index that is not in the file or did not load. The material uses the neutral texture. */
+type LilToonNodeWarningCode = LilToonWarningCode | "missing-texture";
+interface LilToonNodeWarning extends Omit<LilToonWarning, "code"> {
+    code: LilToonNodeWarningCode;
+}
+type LilToonNodeMaterialType = new (parameters?: LilToonNodeMaterialParameters) => LilToonNodeMaterial;
+interface GLTFLilToonNodeExtensionOptions {
+    /** The class to construct. A subclass of LilToonNodeMaterial. */
+    materialType?: LilToonNodeMaterialType;
+    /** Non-fatal compatibility warnings. Omit to log them to the console. */
+    onWarning?: (warning: LilToonNodeWarning) => void;
+}
+/**
+ * Loads `MOCHIYA_materials_liltoon` materials as LilToonNodeMaterial. A material without the extension falls through
+ * to the next plugin. After the scene loads, it adds tangents for the normal map, adds the outline pass, and
+ * publishes the warnings to `onWarning` and `gltf.userData.lilToonWarnings`.
+ */
+declare class GLTFLilToonNodeExtension implements GLTFLoaderPlugin {
+    #private;
+    readonly parser: GLTFParser;
+    readonly options: GLTFLilToonNodeExtensionOptions;
+    readonly name = "MOCHIYA_materials_liltoon";
+    constructor(parser: GLTFParser, options?: GLTFLilToonNodeExtensionOptions);
+    /** The material has the extension. */
+    isLilToonMaterial(materialIndex: number): boolean;
+    /** The extension of the material as the file had it, or undefined. */
+    definition(materialIndex: number): GLTFLilToonMaterialDefinition | undefined;
+    /** The glTF name of the material. */
+    materialName(materialIndex: number): string;
+    /** Add a warning for a lilToon material. afterRoot publishes it with the material warnings. */
+    addWarning(materialIndex: number, code: LilToonNodeWarningCode, property: string, message: string): void;
+    loadMaterial(materialIndex: number): Promise<Material> | null;
+    afterRoot(gltf: GLTF): Promise<void>;
+}
+
+/**
+ * Add MikkTSpace tangents to each geometry that a material of `needsTangents` draws. UniVRM omits TANGENT, and
+ * the tangent frame of three is more stable than the derivative frame. A geometry that has tangents is left
+ * unchanged, and a shared geometry is generated once. When a normal-mapped material that does not need tangents
+ * shares the geometry, the lilToon meshes get a copy, because a tangent attribute would change that material.
+ *
+ * generateIndexedTangents negates the MikkTSpace sign, so `cross(normal, tangent) * w` points to decreasing glTF V
+ * (image up). The material then maps the normal without the Y negation of the derivative path, and both paths give
+ * the same normal.
+ */
+declare function ensureLilToonNodeTangents(meshes: readonly Mesh[], needsTangents: (material: Material) => boolean): Promise<void>;
+
+/**
+ * Add lilToon node materials to a three-vrm VRMLoaderPlugin and return the same instance. A material with the
+ * lilToon extension loads as LilToonNodeMaterial before GLTFLoader reaches the MToon plugin, and the MToon plugin
+ * does not see that material. The tangents and the outline pass are added after the three-vrm afterRoot. Expression
+ * material binds on a lilToon material give a warning; they are not applied. Plain glTF also loads. A second call
+ * on the same plugin does nothing; the options of the first call apply.
+ */
+declare function enableLilToonNodeVRM<T extends VRMLoaderPlugin>(plugin: T, options?: GLTFLilToonNodeExtensionOptions): T & Pick<GLTFLilToonNodeExtension, "loadMaterial">;
+
+export { type GLTFLilToonMaterialDefinition, GLTFLilToonNodeExtension, type GLTFLilToonNodeExtensionOptions, LILTOON_GLTF_EXTENSION, LILTOON_GLTF_SPEC_VERSION, LILTOON_NODE_FEATURES, LILTOON_NODE_VARIANTS, type LilToonLightingHost, LilToonLightingModel, LilToonNodeMaterial, type LilToonNodeMaterialParameters, type LilToonNodeMaterialType, type LilToonNodeMode, type LilToonNodeValue, type LilToonNodeVariant, type LilToonNodeWarning, type LilToonNodeWarningCode, type LilToonScalarOrVector, type LilToonShadingInputs, type LilToonSurface, UNITY_LIGHT_SCALE, enableLilToonNodeVRM, ensureLilToonNodeTangents, generateLilToonOutlines, lilBand, lilBlendColor, lilLimitLight, lilOutlineWidth, lilToonShadingInputs, nodeProperties, nodeVariant, nodeWarnings, tslBacklight, tslBacklightColor, tslBlendColor, tslEmission, tslMatCap, tslOutlineColor, tslOutlinePosition, tslRim };
