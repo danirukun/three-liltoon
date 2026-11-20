@@ -127,9 +127,15 @@ declare class LilToonNodeMaterial extends NodeMaterial {
     getProperty(name: string): number | number[] | undefined;
     setTexture(name: string, value: Texture | null): void;
     getTexture(name: string): Texture;
-    /** The uniform node that reads one property. Its value follows setProperty. */
+    /**
+     * The uniform node that reads one property. All materials share it, and it reads the material that it draws.
+     * Its value is the value of this material until another material is drawn or asks for the node.
+     */
     propertyNode<T extends PropertyType>(name: string, type: T): PropertyNodes[T];
-    /** The texture node that samples one texture slot. Its value follows setTexture. */
+    /**
+     * The texture node that samples one texture slot. All materials share it, and it reads the texture of the material
+     * that it draws. Its value is the texture of this material until another material is drawn or asks for the node.
+     */
     textureNode(name: string): TextureNode;
     /** The compatibility warnings: first each property value of a wrong shape, then the feature warnings. */
     getWarnings(): LilToonWarning[];

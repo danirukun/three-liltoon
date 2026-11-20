@@ -1,6 +1,6 @@
 import { BackSide, FrontSide, DoubleSide, Vector2, Vector3, Vector4, SRGBColorSpace, LinearSRGBColorSpace, RepeatWrapping, BufferAttribute, DataTexture, RGBAFormat, UnsignedByteType, LinearFilter } from 'three';
-import { LightingModel, NodeMaterial } from 'three/webgpu';
-import { positionLocal, uv, select, max, mix, pow, saturate as saturate$1, dot, positionViewDirection, normalize, float, abs, sqrt, modelWorldMatrix, vec4, length, cameraPosition, normalLocal, vec3, normalView, normalViewGeometry, frontFacing, diffuseColor, vec2, dFdx, dFdy, context, texture, normalMap, fwidth, faceDirection, cameraProjectionMatrix, cameraViewMatrix, cross, sin, time, round, min, uniform, clamp } from 'three/tsl';
+import { LightingModel, NodeMaterial, NodeUpdateType, TextureNode } from 'three/webgpu';
+import { positionLocal, uv, select, max, mix, pow, saturate as saturate$1, dot, positionViewDirection, normalize, float, abs, sqrt, modelWorldMatrix, vec4, length, cameraPosition, normalLocal, vec3, normalView, normalViewGeometry, frontFacing, diffuseColor, vec2, dFdx, dFdy, context, normalMap, fwidth, faceDirection, cameraProjectionMatrix, cameraViewMatrix, cross, sin, time, round, min, uniform, clamp } from 'three/tsl';
 
 // src/webgpu/LilToonNodeMaterial.ts
 
@@ -1394,32 +1394,32 @@ function pixelForDefault(name) {
 function getNeutralTexture(name = "white") {
   const existing = neutralTextures.get(name);
   if (existing) return existing;
-  const texture2 = new DataTexture(
+  const texture = new DataTexture(
     new Uint8Array(pixelForDefault(name)),
     1,
     1,
     RGBAFormat,
     UnsignedByteType
   );
-  texture2.name = `three-liltoon:${name}`;
-  texture2.wrapS = RepeatWrapping;
-  texture2.wrapT = RepeatWrapping;
-  texture2.minFilter = LinearFilter;
-  texture2.magFilter = LinearFilter;
-  texture2.generateMipmaps = false;
-  texture2.needsUpdate = true;
-  neutralTextures.set(name, texture2);
-  return texture2;
+  texture.name = `three-liltoon:${name}`;
+  texture.wrapS = RepeatWrapping;
+  texture.wrapT = RepeatWrapping;
+  texture.minFilter = LinearFilter;
+  texture.magFilter = LinearFilter;
+  texture.generateMipmaps = false;
+  texture.needsUpdate = true;
+  neutralTextures.set(name, texture);
+  return texture;
 }
-function normalizeLilToonTexture(property, texture2) {
+function normalizeLilToonTexture(property, texture) {
   const semantic = LILTOON_TEXTURE_SEMANTICS[property];
-  if (!texture2.isCubeTexture)
-    texture2.colorSpace = semantic === "color" ? SRGBColorSpace : LinearSRGBColorSpace;
-  texture2.flipY = false;
-  texture2.wrapS ||= RepeatWrapping;
-  texture2.wrapT ||= RepeatWrapping;
-  texture2.needsUpdate = true;
-  return texture2;
+  if (!texture.isCubeTexture)
+    texture.colorSpace = semantic === "color" ? SRGBColorSpace : LinearSRGBColorSpace;
+  texture.flipY = false;
+  texture.wrapS ||= RepeatWrapping;
+  texture.wrapT ||= RepeatWrapping;
+  texture.needsUpdate = true;
+  return texture;
 }
 
 // src/webgpu/lilToonMath.ts
@@ -1463,10 +1463,10 @@ var lilToonShadingInputs = (source, hasTexture) => {
   };
 };
 var tslSampleST = (inputs, name, at) => {
-  const texture2 = inputs.texture(name);
-  if (!texture2) return vec4(1);
+  const texture = inputs.texture(name);
+  if (!texture) return vec4(1);
   const st = inputs.vec4(`${name}_ST`);
-  return texture2.sample(at.mul(st.xy).add(st.zw));
+  return texture.sample(at.mul(st.xy).add(st.zw));
 };
 var tslBlendColor = (dst, src, srcA, mode) => {
   const ad = dst.add(src);
@@ -1561,9 +1561,9 @@ var tslMatCap = (col, s) => {
     p("_MatCapNormalStrength")
   );
   const matUV = tslMatCapUV(inputs, normalize(normal));
-  const texture2 = inputs.texture("_MatCapTex");
+  const texture = inputs.texture("_MatCapTex");
   const color = inputs.vec4("_MatCapColor");
-  const sampled = texture2 ? color.mul(texture2.sample(matUV).level(p("_MatCapLod"))) : color;
+  const sampled = texture ? color.mul(texture.sample(matUV).level(p("_MatCapLod"))) : color;
   const lit = mix(
     sampled.rgb,
     sampled.rgb.mul(s.lightColor),
@@ -1643,8 +1643,8 @@ var tslEmission = (col, s) => {
 };
 var tslOutlinePosition = (inputs, position = positionLocal) => {
   const p = inputs.float;
-  const texture2 = inputs.texture("_OutlineWidthMask");
-  const mask = texture2 ? texture2.sample(inputs.uvMain).level(float(0)).r : float(1);
+  const texture = inputs.texture("_OutlineWidthMask");
+  const mask = texture ? texture.sample(inputs.uvMain).level(float(0)).r : float(1);
   const positionWS = modelWorldMatrix.mul(vec4(positionLocal, 1)).xyz;
   const near = saturate$1(length(cameraPosition.sub(positionWS)));
   const width = p("_OutlineWidth").mul(0.01).mul(mask).mul(mix(float(1), near, p("_OutlineFixWidth")));
@@ -2260,12 +2260,49 @@ var VECTOR_TYPE = {
   3: "vec3",
   4: "vec4"
 };
+var createVector = (value) => {
+  if (value.length === 2) return new Vector2().fromArray(value);
+  if (value.length === 3) return new Vector3().fromArray(value);
+  return new Vector4().fromArray(value);
+};
 var createUniform = (value) => {
   if (!Array.isArray(value)) return uniform(value);
   if (value.length === 2) return uniform(new Vector2().fromArray(value));
   if (value.length === 3) return uniform(new Vector3().fromArray(value));
   return uniform(new Vector4().fromArray(value));
 };
+var typeOf = (value) => Array.isArray(value) ? VECTOR_TYPE[value.length] : "float";
+var LilToonTextureNode = class extends TextureNode {
+  slot = "";
+  read = () => void 0;
+  #sync(state) {
+    const base = this.getBase();
+    const value = base.read(state, base.slot);
+    if (value !== void 0) base.value = value;
+  }
+  setup(builder) {
+    this.#sync(builder);
+    return super.setup(builder);
+  }
+  updateBefore(frame) {
+    this.#sync(frame);
+    return void 0;
+  }
+  customCacheKey() {
+    return this.id;
+  }
+};
+var textureKey = (value) => [
+  value.mapping,
+  value.channel,
+  value.magFilter,
+  value.minFilter,
+  value.wrapS,
+  value.wrapT,
+  value.wrapR,
+  value.type,
+  value.colorSpace
+].join(":");
 var neutralFor = (name) => {
   const entry = LILTOON_DEFAULTS[name];
   const kind = typeof entry === "object" && entry !== null && "texture" in entry ? String(entry.texture) : "white";
@@ -2277,7 +2314,7 @@ var CULL_SIDE = {
   1: BackSide,
   2: FrontSide
 };
-var LilToonNodeMaterial = class extends NodeMaterial {
+var LilToonNodeMaterial = class _LilToonNodeMaterial extends NodeMaterial {
   isLilToonNodeMaterial = true;
   #isOutline = false;
   #variant = "lilToon";
@@ -2288,9 +2325,24 @@ var LilToonNodeMaterial = class extends NodeMaterial {
   /** The message of each property whose last given value had a wrong shape. getWarnings reports them. */
   #invalid = /* @__PURE__ */ new Map();
   #textures = {};
-  #propertyNodes = /* @__PURE__ */ new Map();
-  #textureNodes = /* @__PURE__ */ new Map();
+  /** The vector of each vector property that the shared nodes read. setProperty updates it in place. */
+  #vectors = /* @__PURE__ */ new Map();
   #shadowed = /* @__PURE__ */ new Set();
+  /**
+   * One node for each property and texture slot, shared by all materials. three keys a program by the node ids,
+   * so per-material nodes would give each material its own program. Each node reads the material it draws.
+   */
+  static #propertyNodes = /* @__PURE__ */ new Map();
+  static #textureNodes = /* @__PURE__ */ new Map();
+  /** The main color and opacity of setupNodes, built once from the shared nodes. */
+  static #mainNodes = null;
+  /** The lilToon material of a draw or a build. A shadow pass draws an override material in place of it. */
+  static #drawn(state) {
+    const isLilToon = (value) => typeof value === "object" && value !== null && #vectors in value;
+    if (isLilToon(state.material)) return state.material;
+    const source = state.renderer?._currentSourceMaterial;
+    return isLilToon(source) ? source : void 0;
+  }
   constructor(parameters = {}) {
     super();
     this.lights = true;
@@ -2381,26 +2433,46 @@ var LilToonNodeMaterial = class extends NodeMaterial {
   getTexture(name) {
     return this.#textures[name] ?? neutralFor(name);
   }
-  /** The uniform node that reads one property. Its value follows setProperty. */
+  /**
+   * The uniform node that reads one property. All materials share it, and it reads the material that it draws.
+   * Its value is the value of this material until another material is drawn or asks for the node.
+   */
   propertyNode(name, type) {
     const value = this.#properties[name];
     if (value === void 0)
       throw new RangeError(`Unknown lilToon property ${name}`);
-    const actual = Array.isArray(value) ? VECTOR_TYPE[value.length] : "float";
+    const actual = typeOf(value);
     if (actual !== type)
       throw new TypeError(`${name} is a ${actual}, not a ${type}`);
-    const existing = this.#propertyNodes.get(name);
-    if (existing) return existing;
-    const node = createUniform(value);
-    this.#propertyNodes.set(name, node);
+    const nodes = _LilToonNodeMaterial.#propertyNodes;
+    const key = `${name}|${type}`;
+    let node = nodes.get(key);
+    if (!node) {
+      node = createUniform(value).onObjectUpdate((frame) => {
+        const drawn = _LilToonNodeMaterial.#drawn(frame);
+        return drawn && drawn.#uniform(name);
+      });
+      nodes.set(key, node);
+    }
+    node.value = this.#uniform(name);
     return node;
   }
-  /** The texture node that samples one texture slot. Its value follows setTexture. */
+  /**
+   * The texture node that samples one texture slot. All materials share it, and it reads the texture of the material
+   * that it draws. Its value is the texture of this material until another material is drawn or asks for the node.
+   */
   textureNode(name) {
-    const existing = this.#textureNodes.get(name);
-    if (existing) return existing;
-    const node = texture(this.getTexture(name));
-    this.#textureNodes.set(name, node);
+    const nodes = _LilToonNodeMaterial.#textureNodes;
+    let node = nodes.get(name);
+    if (!node) {
+      node = new LilToonTextureNode(this.getTexture(name));
+      node.slot = name;
+      node.read = (state, slot) => _LilToonNodeMaterial.#drawn(state)?.getTexture(slot);
+      node.mergeable = false;
+      node.updateBeforeType = NodeUpdateType.OBJECT;
+      nodes.set(name, node);
+    }
+    node.value = this.getTexture(name);
     return node;
   }
   /** The compatibility warnings: first each property value of a wrong shape, then the feature warnings. */
@@ -2444,8 +2516,7 @@ var LilToonNodeMaterial = class extends NodeMaterial {
     );
     this.#invalid = new Map(source.#invalid);
     this.#textures = { ...source.#textures };
-    this.#propertyNodes.clear();
-    this.#textureNodes.clear();
+    this.#vectors = /* @__PURE__ */ new Map();
     this.#applyAlphaMode();
     this.setupNodes();
     this.needsUpdate = true;
@@ -2460,14 +2531,26 @@ var LilToonNodeMaterial = class extends NodeMaterial {
   }
   #assignTexture(name, value) {
     this.#textures[name] = value ? normalizeLilToonTexture(name, value) : null;
-    const node = this.#textureNodes.get(name);
+    const node = _LilToonNodeMaterial.#textureNodes.get(name);
     if (node) node.value = this.getTexture(name);
   }
+  /** The value that the shared node of one property reads: the number, or the vector of this material. */
+  #uniform(name) {
+    const value = this.#properties[name];
+    if (!Array.isArray(value)) return value;
+    let vector = this.#vectors.get(name);
+    if (!vector) {
+      vector = createVector(value);
+      this.#vectors.set(name, vector);
+    }
+    return vector;
+  }
   #syncNode(name, value) {
-    const node = this.#propertyNodes.get(name);
-    if (!node) return;
-    if (Array.isArray(value)) node.value.fromArray(value);
-    else node.value = value;
+    if (Array.isArray(value)) this.#vectors.get(name)?.fromArray(value);
+    const node = _LilToonNodeMaterial.#propertyNodes.get(
+      `${name}|${typeOf(value)}`
+    );
+    if (node) node.value = this.#uniform(name);
   }
   /**
    * The build state of the lighting model. `setupLighting` assigns the shadowed set and then calls
@@ -2558,9 +2641,13 @@ var LilToonNodeMaterial = class extends NodeMaterial {
   #features() {
     return enabledNodeFeatures(this.#variant, this.#properties).filter((feature) => LILTOON_NODE_FEATURES.has(feature)).sort();
   }
+  /**
+   * The features, the texture slots with a texture, and the sampler state of each texture. The shared texture nodes
+   * are not top-level material textures, so three does not add their sampler state to the material key.
+   */
   #programKey() {
     const features = this.#features();
-    const present = Object.keys(this.#textures).filter((name) => this.#textures[name] !== null).sort();
+    const present = Object.keys(this.#textures).filter((name) => this.#textures[name] != null).sort().map((name) => `${name}{${textureKey(this.#textures[name])}}`);
     const pass = this.isOutline ? "|outline" : "";
     return `${this.#variant}|${features.join(",")}|${present.join(",")}${pass}`;
   }
@@ -2584,11 +2671,16 @@ var LilToonNodeMaterial = class extends NodeMaterial {
   setupNodes() {
     const st = this.propertyNode("_MainTex_ST", "vec4");
     const color = this.propertyNode("_Color", "vec4");
-    const main = this.textureNode("_MainTex").sample(
-      uv().mul(st.xy).add(st.zw)
-    );
-    this.colorNode = vec4(color.rgb.mul(main.rgb), 1);
-    this.opacityNode = float(color.a).mul(main.a);
+    const texture = this.textureNode("_MainTex");
+    _LilToonNodeMaterial.#mainNodes ??= (() => {
+      const main = texture.sample(uv().mul(st.xy).add(st.zw));
+      return {
+        color: vec4(color.rgb.mul(main.rgb), 1),
+        opacity: float(color.a).mul(main.a)
+      };
+    })();
+    this.colorNode = _LilToonNodeMaterial.#mainNodes.color;
+    this.opacityNode = _LilToonNodeMaterial.#mainNodes.opacity;
   }
 };
 var isMesh = (object) => object.isMesh === true;
@@ -2937,11 +3029,11 @@ var GLTFLilToonNodeExtension = class {
         warning: `${property} uses texture index ${String(index)}, and the file has ${count} textures. ${fallback}`
       };
     try {
-      const texture2 = await this.parser.getDependency(
+      const texture = await this.parser.getDependency(
         "texture",
         index
       );
-      if (texture2) return { texture: texture2 };
+      if (texture) return { texture };
       return {
         texture: null,
         warning: `${property} texture ${index} did not load. ${fallback}`

@@ -252,6 +252,7 @@ describe("LilToonNodeMaterial subclass hooks", () => {
 		expect(clone).toBeInstanceOf(Sub);
 		expect(clone.alphaTestNode).not.toBeNull();
 		expect(clone.alphaTestNode).not.toBe(source.alphaTestNode);
-		expect(clone.colorNode).not.toBe(source.colorNode);
+		// The main color nodes are shared by all materials and read the material they draw (programShare.test.ts).
+		expect(clone.colorNode).toBe(source.colorNode);
 	});
 });

@@ -7,11 +7,16 @@ import {
 	Vector4,
 } from "three";
 import type { Side, Texture } from "three";
-import { NodeMaterial } from "three/webgpu";
+import {
+	NodeMaterial,
+	NodeUpdateType,
+	TextureNode as TextureNodeBase,
+} from "three/webgpu";
 import type {
 	LightingModel,
 	Node,
 	NodeBuilder,
+	NodeFrame,
 	TextureNode as TextureNodeType,
 	UniformNode,
 } from "three/webgpu";
@@ -20,7 +25,6 @@ import {
 	float,
 	normalMap,
 	positionLocal,
-	texture,
 	uniform,
 	uv,
 	vec2,
@@ -79,6 +83,12 @@ const VECTOR_TYPE: Record<number, PropertyType> = {
 };
 type TextureNode = TextureNodeType<"vec4">;
 
+const createVector = (value: number[]): VectorValue => {
+	if (value.length === 2) return new Vector2().fromArray(value);
+	if (value.length === 3) return new Vector3().fromArray(value);
+	return new Vector4().fromArray(value);
+};
+
 const createUniform = (
 	value: LilToonNodeValue,
 ): PropertyNodes[PropertyType] => {
@@ -87,6 +97,60 @@ const createUniform = (
 	if (value.length === 3) return uniform(new Vector3().fromArray(value));
 	return uniform(new Vector4().fromArray(value));
 };
+
+const typeOf = (value: LilToonNodeValue): PropertyType =>
+	Array.isArray(value) ? VECTOR_TYPE[value.length]! : "float";
+
+/** A node frame or a node builder: the material it draws, and in a shadow pass the material the override stands in for. */
+type DrawState = {
+	material?: unknown;
+	renderer?: { _currentSourceMaterial?: unknown } | null;
+};
+
+/**
+ * The shared texture node of one slot. The nodes that `sample` and `level` clone from it read its value, so one
+ * update before each draw sets the texture for all of them. The sampler state is in the program key, so the node key
+ * is the node id only: the texture of the last draw must not change the key.
+ */
+class LilToonTextureNode extends TextureNodeBase {
+	slot = "";
+	read: (state: DrawState, slot: string) => Texture | undefined = () =>
+		undefined;
+
+	#sync(state: DrawState): void {
+		const base = this.getBase() as LilToonTextureNode;
+		const value = base.read(state, base.slot);
+		if (value !== undefined) base.value = value;
+	}
+
+	override setup(builder: NodeBuilder) {
+		this.#sync(builder as unknown as DrawState);
+		return super.setup(builder);
+	}
+
+	override updateBefore(frame: NodeFrame): undefined {
+		this.#sync(frame as unknown as DrawState);
+		return undefined;
+	}
+
+	override customCacheKey(): number {
+		return this.id;
+	}
+}
+
+/** The texture fields that three adds to the key of a top-level material texture, and the ones a program bakes in. */
+const textureKey = (value: Texture): string =>
+	[
+		value.mapping,
+		value.channel,
+		value.magFilter,
+		value.minFilter,
+		value.wrapS,
+		value.wrapT,
+		(value as { wrapR?: number }).wrapR,
+		value.type,
+		value.colorSpace,
+	].join(":");
 
 const neutralFor = (name: string): Texture => {
 	const entry = (LILTOON_DEFAULTS as Record<string, unknown>)[name];
@@ -118,9 +182,28 @@ export class LilToonNodeMaterial extends NodeMaterial {
 	/** The message of each property whose last given value had a wrong shape. getWarnings reports them. */
 	#invalid = new Map<string, string>();
 	#textures: Record<string, Texture | null> = {};
-	#propertyNodes = new Map<string, PropertyNodes[PropertyType]>();
-	#textureNodes = new Map<string, TextureNode>();
+	/** The vector of each vector property that the shared nodes read. setProperty updates it in place. */
+	#vectors = new Map<string, VectorValue>();
 	#shadowed = new Set<object>();
+
+	/**
+	 * One node for each property and texture slot, shared by all materials. three keys a program by the node ids,
+	 * so per-material nodes would give each material its own program. Each node reads the material it draws.
+	 */
+	static #propertyNodes = new Map<string, PropertyNodes[PropertyType]>();
+	static #textureNodes = new Map<string, LilToonTextureNode>();
+	/** The main color and opacity of setupNodes, built once from the shared nodes. */
+	static #mainNodes: { color: Node<"vec4">; opacity: Node<"float"> } | null =
+		null;
+
+	/** The lilToon material of a draw or a build. A shadow pass draws an override material in place of it. */
+	static #drawn(state: DrawState): LilToonNodeMaterial | undefined {
+		const isLilToon = (value: unknown): value is LilToonNodeMaterial =>
+			typeof value === "object" && value !== null && #vectors in value;
+		if (isLilToon(state.material)) return state.material;
+		const source = state.renderer?._currentSourceMaterial;
+		return isLilToon(source) ? source : undefined;
+	}
 
 	constructor(parameters: LilToonNodeMaterialParameters = {}) {
 		super();
@@ -232,7 +315,10 @@ export class LilToonNodeMaterial extends NodeMaterial {
 		return this.#textures[name] ?? neutralFor(name);
 	}
 
-	/** The uniform node that reads one property. Its value follows setProperty. */
+	/**
+	 * The uniform node that reads one property. All materials share it, and it reads the material that it draws.
+	 * Its value is the value of this material until another material is drawn or asks for the node.
+	 */
 	propertyNode<T extends PropertyType>(
 		name: string,
 		type: T,
@@ -240,23 +326,44 @@ export class LilToonNodeMaterial extends NodeMaterial {
 		const value = this.#properties[name];
 		if (value === undefined)
 			throw new RangeError(`Unknown lilToon property ${name}`);
-		const actual = Array.isArray(value) ? VECTOR_TYPE[value.length] : "float";
+		const actual = typeOf(value);
 		if (actual !== type)
 			throw new TypeError(`${name} is a ${actual}, not a ${type}`);
-		const existing = this.#propertyNodes.get(name);
-		if (existing) return existing as PropertyNodes[T];
-		const node = createUniform(value);
-		this.#propertyNodes.set(name, node);
+		const nodes = LilToonNodeMaterial.#propertyNodes;
+		const key = `${name}|${type}`;
+		let node = nodes.get(key);
+		if (!node) {
+			node = (
+				createUniform(value) as UniformNode<"float", unknown>
+			).onObjectUpdate((frame) => {
+				const drawn = LilToonNodeMaterial.#drawn(frame as unknown as DrawState);
+				return drawn && drawn.#uniform(name);
+			}) as PropertyNodes[PropertyType];
+			nodes.set(key, node);
+		}
+		node.value = this.#uniform(name)!;
 		return node as PropertyNodes[T];
 	}
 
-	/** The texture node that samples one texture slot. Its value follows setTexture. */
+	/**
+	 * The texture node that samples one texture slot. All materials share it, and it reads the texture of the material
+	 * that it draws. Its value is the texture of this material until another material is drawn or asks for the node.
+	 */
 	textureNode(name: string): TextureNode {
-		const existing = this.#textureNodes.get(name);
-		if (existing) return existing;
-		const node = texture(this.getTexture(name)) as unknown as TextureNode;
-		this.#textureNodes.set(name, node);
-		return node;
+		const nodes = LilToonNodeMaterial.#textureNodes;
+		let node = nodes.get(name);
+		if (!node) {
+			node = new LilToonTextureNode(this.getTexture(name));
+			node.slot = name;
+			node.read = (state, slot) =>
+				LilToonNodeMaterial.#drawn(state)?.getTexture(slot);
+			// Not merged with another slot that has the same texture at build time.
+			node.mergeable = false;
+			node.updateBeforeType = NodeUpdateType.OBJECT;
+			nodes.set(name, node);
+		}
+		node.value = this.getTexture(name);
+		return node as unknown as TextureNode;
 	}
 
 	/** The compatibility warnings: first each property value of a wrong shape, then the feature warnings. */
@@ -302,8 +409,7 @@ export class LilToonNodeMaterial extends NodeMaterial {
 		);
 		this.#invalid = new Map(source.#invalid);
 		this.#textures = { ...source.#textures };
-		this.#propertyNodes.clear();
-		this.#textureNodes.clear();
+		this.#vectors = new Map();
 		this.#applyAlphaMode();
 		this.setupNodes();
 		this.needsUpdate = true;
@@ -320,15 +426,28 @@ export class LilToonNodeMaterial extends NodeMaterial {
 
 	#assignTexture(name: string, value: Texture | null): void {
 		this.#textures[name] = value ? normalizeLilToonTexture(name, value) : null;
-		const node = this.#textureNodes.get(name);
+		const node = LilToonNodeMaterial.#textureNodes.get(name);
 		if (node) node.value = this.getTexture(name);
 	}
 
+	/** The value that the shared node of one property reads: the number, or the vector of this material. */
+	#uniform(name: string): number | VectorValue | undefined {
+		const value = this.#properties[name];
+		if (!Array.isArray(value)) return value;
+		let vector = this.#vectors.get(name);
+		if (!vector) {
+			vector = createVector(value);
+			this.#vectors.set(name, vector);
+		}
+		return vector;
+	}
+
 	#syncNode(name: string, value: LilToonNodeValue): void {
-		const node = this.#propertyNodes.get(name);
-		if (!node) return;
-		if (Array.isArray(value)) (node.value as VectorValue).fromArray(value);
-		else node.value = value;
+		if (Array.isArray(value)) this.#vectors.get(name)?.fromArray(value);
+		const node = LilToonNodeMaterial.#propertyNodes.get(
+			`${name}|${typeOf(value)}`,
+		);
+		if (node) node.value = this.#uniform(name)!;
 	}
 
 	/**
@@ -440,11 +559,16 @@ export class LilToonNodeMaterial extends NodeMaterial {
 			.sort();
 	}
 
+	/**
+	 * The features, the texture slots with a texture, and the sampler state of each texture. The shared texture nodes
+	 * are not top-level material textures, so three does not add their sampler state to the material key.
+	 */
 	#programKey(): string {
 		const features = this.#features();
 		const present = Object.keys(this.#textures)
-			.filter((name) => this.#textures[name] !== null)
-			.sort();
+			.filter((name) => this.#textures[name] != null)
+			.sort()
+			.map((name) => `${name}{${textureKey(this.#textures[name]!)}}`);
 		const pass = this.isOutline ? "|outline" : "";
 		return `${this.#variant}|${features.join(",")}|${present.join(",")}${pass}`;
 	}
@@ -474,10 +598,16 @@ export class LilToonNodeMaterial extends NodeMaterial {
 	protected setupNodes(): void {
 		const st = this.propertyNode("_MainTex_ST", "vec4");
 		const color = this.propertyNode("_Color", "vec4");
-		const main = this.textureNode("_MainTex").sample(
-			uv().mul(st.xy).add(st.zw),
-		);
-		this.colorNode = vec4(color.rgb.mul(main.rgb), 1);
-		this.opacityNode = float(color.a).mul(main.a);
+		const texture = this.textureNode("_MainTex");
+		// Built once: the program key hashes the node ids of colorNode and opacityNode.
+		LilToonNodeMaterial.#mainNodes ??= (() => {
+			const main = texture.sample(uv().mul(st.xy).add(st.zw));
+			return {
+				color: vec4(color.rgb.mul(main.rgb), 1),
+				opacity: float(color.a).mul(main.a),
+			};
+		})();
+		this.colorNode = LilToonNodeMaterial.#mainNodes.color;
+		this.opacityNode = LilToonNodeMaterial.#mainNodes.opacity;
 	}
 }
