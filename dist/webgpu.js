@@ -1717,6 +1717,7 @@ var tslShade = (input) => {
       input.shadow3rdColor.a.sub(bands.z.mul(input.shadow3rdColor.a))
     );
   indirect = mix(indirect, indirect.mul(albedo), input.shadowMainStrength);
+  if (input.shade) indirect = input.shade(indirect);
   const direct = albedo.mul(light);
   indirect = indirect.mul(light);
   indirect = mix(
@@ -1926,10 +1927,15 @@ var LilToonLightingModel = class extends LightingModel {
       normal: this.#normalN,
       geometryNormal: this.#geometryNormal
     };
+    const strength = host.effectStrength();
+    const effect = (before, after) => strength ? mix(before, after, strength) : after;
     if (features.has("backlight"))
-      col = col.add(tslBacklightColor(surface, this.#normalizedBacklight()));
-    if (features.has("matcap")) col = tslMatCap(col, surface);
-    if (features.has("rim")) col = tslRim(col, surface);
+      col = effect(
+        col,
+        col.add(tslBacklightColor(surface, this.#normalizedBacklight()))
+      );
+    if (features.has("matcap")) col = effect(col, tslMatCap(col, surface));
+    if (features.has("rim")) col = effect(col, tslRim(col, surface));
     if (features.has("emission1st")) col = tslEmission(col, surface);
     outgoingLight.addAssign(col.add(this.#added));
   }
@@ -1979,7 +1985,8 @@ var LilToonLightingModel = class extends LightingModel {
       shadow3rdColorTex: color("_Shadow3rdColorTex"),
       shadowMainStrength: p("_ShadowMainStrength"),
       shadowEnvStrength: p("_ShadowEnvStrength"),
-      shadowBorderColor: v4("_ShadowBorderColor").rgb
+      shadowBorderColor: v4("_ShadowBorderColor").rgb,
+      shade: (shade) => this.#host.shadeColor(shade)
     });
   }
   /**
@@ -2463,6 +2470,20 @@ var LilToonNodeMaterial = class _LilToonNodeMaterial extends NodeMaterial {
   roomIrradiance(_irradiance, _iblIrradiance) {
     return null;
   }
+  /**
+   * The shade color of the bands, after the shadow colors and `_ShadowMainStrength` and before the light. A subclass
+   * overrides it.
+   */
+  shadeColor(shade) {
+    return shade;
+  }
+  /**
+   * A factor on the backlight, matcap, and rim terms: 1 keeps them and 0 removes them. `null` keeps them. A subclass
+   * overrides it.
+   */
+  effectStrength() {
+    return null;
+  }
   /** Set one property. A value of a wrong shape is ignored, and getWarnings names it until a value fits. */
   setProperty(name, value) {
     const checked = checkNodeValue(name, value, this.#properties[name]);
@@ -2626,6 +2647,8 @@ var LilToonNodeMaterial = class _LilToonNodeMaterial extends NodeMaterial {
       receivedShadow: (shadow) => this.receivedShadow(shadow),
       shadowAfterBands: this.receivedShadowAfterBands(),
       roomIrradiance: (irradiance, iblIrradiance) => this.roomIrradiance(irradiance, iblIrradiance),
+      shadeColor: (shade) => this.shadeColor(shade),
+      effectStrength: () => this.effectStrength(),
       outline,
       transparent: this.#mode === "transparent",
       normalMapped: this.#normalMapped()

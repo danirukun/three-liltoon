@@ -294,6 +294,22 @@ export class LilToonNodeMaterial extends NodeMaterial {
 		return null;
 	}
 
+	/**
+	 * The shade color of the bands, after the shadow colors and `_ShadowMainStrength` and before the light. A subclass
+	 * overrides it.
+	 */
+	protected shadeColor(shade: Node<"vec3">): Node<"vec3"> {
+		return shade;
+	}
+
+	/**
+	 * A factor on the backlight, matcap, and rim terms: 1 keeps them and 0 removes them. `null` keeps them. A subclass
+	 * overrides it.
+	 */
+	protected effectStrength(): Node<"float"> | null {
+		return null;
+	}
+
 	/** Set one property. A value of a wrong shape is ignored, and getWarnings names it until a value fits. */
 	setProperty(name: string, value: LilToonScalarOrVector): void {
 		const checked = checkNodeValue(name, value, this.#properties[name]);
@@ -478,6 +494,8 @@ export class LilToonNodeMaterial extends NodeMaterial {
 			shadowAfterBands: this.receivedShadowAfterBands(),
 			roomIrradiance: (irradiance, iblIrradiance) =>
 				this.roomIrradiance(irradiance, iblIrradiance),
+			shadeColor: (shade) => this.shadeColor(shade),
+			effectStrength: () => this.effectStrength(),
 			outline,
 			transparent: this.#mode === "transparent",
 			normalMapped: this.#normalMapped(),

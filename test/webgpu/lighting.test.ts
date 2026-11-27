@@ -214,6 +214,57 @@ describe("LilToonLightingModel", () => {
 		expect(calls).toEqual([[context.irradiance, context.iblIrradiance]]);
 	});
 
+	it("puts the shade of the shadeColor hook of a subclass into the shading", () => {
+		const marker = float(0.123);
+		const calls: Node[] = [];
+		class Sub extends LilToonNodeMaterial {
+			protected override shadeColor(shade: Node<"vec3">): Node<"vec3"> {
+				calls.push(shade);
+				return shade.mul(marker);
+			}
+		}
+		const lit = (properties: Record<string, number>) =>
+			runModel(new Sub({ properties }), [
+				{ shadowNode: null, baseColorNode: null },
+			]).outgoing;
+		expect(contains(lit({ _UseShadow: 1 }), marker)).toBe(true);
+		expect(calls).toHaveLength(1);
+		// lilToon draws no shade without `_UseShadow`.
+		expect(contains(lit({}), marker)).toBe(false);
+		expect(calls).toHaveLength(1);
+	});
+
+	it("scales the backlight, matcap, and rim by the effectStrength of a subclass, and not the emission", () => {
+		const strength = float(0.25);
+		class Sub extends LilToonNodeMaterial {
+			protected override effectStrength(): Node<"float"> {
+				return strength;
+			}
+		}
+		const lit = (properties: Record<string, number>) =>
+			runModel(new Sub({ properties }), [
+				{ shadowNode: null, baseColorNode: null },
+			]).outgoing;
+		for (const use of ["_UseBacklight", "_UseMatCap", "_UseRim"])
+			expect(contains(lit({ [use]: 1 }), strength), use).toBe(true);
+		expect(contains(lit({ _UseEmission: 1 }), strength)).toBe(false);
+	});
+
+	it("keeps the shade and the effects without a subclass hook", () => {
+		class Probe extends LilToonNodeMaterial {
+			shade(shade: Node<"vec3">) {
+				return this.shadeColor(shade);
+			}
+			strength() {
+				return this.effectStrength();
+			}
+		}
+		const material = new Probe();
+		const shade = vec3(0.5);
+		expect(material.shade(shade)).toBe(shade);
+		expect(material.strength()).toBeNull();
+	});
+
 	it("builds the graph with every shadow band and color texture", () => {
 		const material = new LilToonNodeMaterial({
 			properties: { _UseShadow: 1, _Shadow3rdColor: [0, 0, 1, 0.5] },

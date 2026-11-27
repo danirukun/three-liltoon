@@ -128,6 +128,16 @@ declare class LilToonNodeMaterial extends NodeMaterial {
      * `iblIrradiance` is what `setupEnvironment()` adds. `null` uses `irradiance`. A subclass overrides it.
      */
     protected roomIrradiance(_irradiance: Node<"vec3">, _iblIrradiance: Node<"vec3">): Node<"vec3"> | null;
+    /**
+     * The shade color of the bands, after the shadow colors and `_ShadowMainStrength` and before the light. A subclass
+     * overrides it.
+     */
+    protected shadeColor(shade: Node<"vec3">): Node<"vec3">;
+    /**
+     * A factor on the backlight, matcap, and rim terms: 1 keeps them and 0 removes them. `null` keeps them. A subclass
+     * overrides it.
+     */
+    protected effectStrength(): Node<"float"> | null;
     /** Set one property. A value of a wrong shape is ignored, and getWarnings names it until a value fits. */
     setProperty(name: string, value: LilToonScalarOrVector): void;
     getProperty(name: string): number | number[] | undefined;
@@ -183,6 +193,10 @@ interface LilToonLightingHost {
     /** The received shadow multiplies the bands after the band step (MToon) instead of the half Lambert value (lilToon). */
     shadowAfterBands: boolean;
     roomIrradiance(irradiance: Vec3$1, iblIrradiance: Vec3$1): Vec3$1 | null;
+    /** The shade color before the light (the shadeColor hook of the material). */
+    shadeColor(shade: Vec3$1): Vec3$1;
+    /** The factor on the backlight, matcap, and rim terms; `null` keeps them. */
+    effectStrength(): Float$1 | null;
     /** The material is the outline of generateLilToonOutlines. It draws the outline color only. */
     outline: boolean;
     /** LIL_RENDER == 2. */

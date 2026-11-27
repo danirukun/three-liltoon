@@ -63,6 +63,10 @@ export interface LilToonLightingHost {
 	/** The received shadow multiplies the bands after the band step (MToon) instead of the half Lambert value (lilToon). */
 	shadowAfterBands: boolean;
 	roomIrradiance(irradiance: Vec3, iblIrradiance: Vec3): Vec3 | null;
+	/** The shade color before the light (the shadeColor hook of the material). */
+	shadeColor(shade: Vec3): Vec3;
+	/** The factor on the backlight, matcap, and rim terms; `null` keeps them. */
+	effectStrength(): Float | null;
 	/** The material is the outline of generateLilToonOutlines. It draws the outline color only. */
 	outline: boolean;
 	/** LIL_RENDER == 2. */
@@ -194,6 +198,8 @@ export interface TslShadeInput {
 	shadowMainStrength: Float;
 	shadowEnvStrength: Float;
 	shadowBorderColor: Vec3;
+	/** Changes the shade color before the light. */
+	shade?: (shade: Vec3) => Vec3;
 }
 
 /** lilShade. The line numbers are in lilToonMath.ts. */
@@ -215,6 +221,7 @@ export const tslShade = (input: TslShadeInput): Vec3 => {
 			input.shadow3rdColor.a.sub(bands.z.mul(input.shadow3rdColor.a)),
 		);
 	indirect = mix(indirect, indirect.mul(albedo), input.shadowMainStrength);
+	if (input.shade) indirect = input.shade(indirect);
 	const direct = albedo.mul(light);
 	indirect = indirect.mul(light);
 	indirect = mix(
@@ -491,10 +498,16 @@ export class LilToonLightingModel extends LightingModel {
 			geometryNormal: this.#geometryNormal,
 		};
 		// The order of lil_pass_forward_normal.hlsl: backlight, matcap, rim light, emission.
+		const strength = host.effectStrength();
+		const effect = (before: Vec3, after: Vec3): Vec3 =>
+			strength ? mix(before, after, strength) : after;
 		if (features.has("backlight"))
-			col = col.add(tslBacklightColor(surface, this.#normalizedBacklight()));
-		if (features.has("matcap")) col = tslMatCap(col, surface);
-		if (features.has("rim")) col = tslRim(col, surface);
+			col = effect(
+				col,
+				col.add(tslBacklightColor(surface, this.#normalizedBacklight())),
+			);
+		if (features.has("matcap")) col = effect(col, tslMatCap(col, surface));
+		if (features.has("rim")) col = effect(col, tslRim(col, surface));
 		if (features.has("emission1st")) col = tslEmission(col, surface);
 		outgoingLight.addAssign(col.add(this.#added));
 	}
@@ -555,6 +568,7 @@ export class LilToonLightingModel extends LightingModel {
 			shadowMainStrength: p("_ShadowMainStrength"),
 			shadowEnvStrength: p("_ShadowEnvStrength"),
 			shadowBorderColor: v4("_ShadowBorderColor").rgb,
+			shade: (shade) => this.#host.shadeColor(shade),
 		});
 	}
 
